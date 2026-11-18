@@ -478,6 +478,7 @@ button { cursor: pointer; }
 .ai-item-actions .danger { color: #ffd0d0; border-color: #8a3a3a; }
 .ai-footer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
 .ai-footer-actions button { width: 100%; min-height: 40px; margin: 0; }
+.ai-footer-wide { grid-column: 1 / -1; }
 .ai-storage-note { margin: 8px 0 0; font-size: 12px; line-height: 1.5; }
 .toast {
   position: fixed;

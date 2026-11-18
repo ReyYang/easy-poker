@@ -173,6 +173,7 @@
           <div class="ai-footer-actions">
             <button type="button" id="ai-add-open" class="primary">添加 AI</button>
             <button type="button" id="ai-profiles-open" class="ghost">管理模型配置</button>
+            <button type="button" id="ai-add-preset" class="ghost ai-footer-wide">一键添加 5 位牌手</button>
           </div>
         </section>
 
@@ -181,7 +182,7 @@
           <label class="field"><span>水平 / 牌手风格</span><select id="ai-level"><option value="beginner">新手</option><option value="experienced" selected>有经验</option><option value="pro">职业</option><option value="tom_dwan">Tom Dwan</option><option value="tan_xuan">谭轩</option><option value="phil_ivey">Phil Ivey</option><option value="alan_keating">Alan Keating</option><option value="aaron_zang">臧书奴</option></select></label>
           <label class="field"><span>模型配置</span><select id="ai-profile" required></select></label>
           <label class="field"><span>买入次数</span><input id="ai-buyins" type="number" min="1" value="1" required /></label>
-          <div class="ai-footer-actions"><button type="submit" class="primary">添加并坐下</button><button type="button" class="ghost" data-ai-back>返回</button></div>
+          <div class="ai-footer-actions"><button type="submit" class="primary">添加并坐下</button><button type="button" class="ghost" data-ai-back>返回</button><button type="button" id="ai-bot-preset" class="ghost ai-footer-wide">用所选配置一键添加 5 位牌手</button></div>
         </form>
 
         <section id="ai-profiles-view" class="hidden">

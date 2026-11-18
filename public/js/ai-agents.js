@@ -1,4 +1,4 @@
-import { decide, gameWsUrl, legalMove, PROMPTS, PROMPT_LABELS } from "./agent-core.js";
+import { decide, gameWsUrl, legalMove, PRESET_BOTS, PROMPTS, PROMPT_LABELS } from "./agent-core.js";
 
 const PROFILES_KEY = "easy-poker.ai.profiles.v1";
 const TABLES_KEY = "easy-poker.ai.tables.v1";
@@ -173,6 +173,29 @@ export class BrowserAiAgents {
     this.persistBots();
     this.onChange();
     this.start(bot);
+  }
+
+  addPresetBots(profileId, buyinCount = 1) {
+    if (!this.tableNumber) throw new Error("尚未进入牌桌");
+    if (!this.profiles.some((profile) => profile.id === profileId)) throw new Error("请选择模型配置");
+    const existingLevels = new Set(this.bots.map((bot) => bot.level));
+    const existingNames = new Set(this.bots.map((bot) => bot.nickname));
+    const missing = PRESET_BOTS.filter((preset) => !existingLevels.has(preset.level) && !existingNames.has(preset.nickname));
+    if (!missing.length) throw new Error("5 位风格牌手已在列表中");
+    const count = Math.max(1, Math.floor(Number(buyinCount) || 1));
+    const created = missing.map((preset) => ({
+      botId: crypto.randomUUID(),
+      playerId: crypto.randomUUID(),
+      nickname: preset.nickname,
+      level: preset.level,
+      profileId,
+      buyinCount: count,
+    }));
+    this.bots.push(...created);
+    this.persistBots();
+    this.onChange();
+    for (const bot of created) this.start(bot);
+    return created.length;
   }
 
   async removeBot(botId) {

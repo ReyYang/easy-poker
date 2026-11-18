@@ -987,6 +987,15 @@ function openProfileForm(profileId = "") {
   showAiView("ai-profile-form", profile ? `编辑 ${profile.keyLabel}` : "添加模型配置");
 }
 
+function addPresetBots(profileId, buyinCount = 1) {
+  try {
+    const added = aiAgents.addPresetBots(profileId, buyinCount);
+    renderAiList();
+    showAiView("ai-list-view", "AI玩家");
+    toast(`已添加 ${added} 位牌手`);
+  } catch (err) { toast(err.message); }
+}
+
 $("btn-ai").onclick = () => {
   renderAiList();
   showAiView("ai-list-view", "AI玩家");
@@ -994,6 +1003,19 @@ $("btn-ai").onclick = () => {
 };
 $("ai-close").onclick = () => $("ai-modal").classList.add("hidden");
 $("ai-add-open").onclick = openBotForm;
+$("ai-add-preset").onclick = () => {
+  const profiles = aiAgents.getProfiles();
+  if (!profiles.length) {
+    renderAiProfiles();
+    showAiView("ai-profiles-view", "模型配置");
+    toast("请先添加模型配置");
+    return;
+  }
+  if (profiles.length === 1) return addPresetBots(profiles[0].id);
+  openBotForm();
+  toast("请选择模型配置后点击一键添加 5 位牌手");
+};
+$("ai-bot-preset").onclick = () => addPresetBots($("ai-profile").value, $("ai-buyins").value);
 $("ai-profiles-open").onclick = () => { renderAiProfiles(); showAiView("ai-profiles-view", "模型配置"); };
 document.querySelectorAll("[data-ai-back]").forEach((button) => { button.onclick = () => { renderAiList(); showAiView("ai-list-view", "AI玩家"); }; });
 $("ai-profile-new").onclick = () => openProfileForm();

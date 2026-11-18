@@ -20,6 +20,14 @@ export const PROMPT_LABELS = {
   aaron_zang: "臧书奴",
 };
 
+export const PRESET_BOTS = [
+  { nickname: "Tom Dwan", level: "tom_dwan" },
+  { nickname: "谭轩", level: "tan_xuan" },
+  { nickname: "Phil Ivey", level: "phil_ivey" },
+  { nickname: "Alan Keating", level: "alan_keating" },
+  { nickname: "臧书奴", level: "aaron_zang" },
+];
+
 function playerPositions(seats) {
   const players = seats.map((player, seat) => player?.inHand ? { ...player, seat } : null).filter(Boolean);
   const positions = new Map(players.map((player) => [player.playerId,
@@ -128,6 +136,22 @@ async function request(url, body, config, signal) {
   return data;
 }
 
+export function reasoningEffortForModel(model) {
+  const name = String(model ?? "").trim().toLowerCase();
+  if (!name) return undefined;
+  // Prefer minimal latency on reasoning models so decisions fit inside the 8s/10s turn clock.
+  if (/^gpt-5\.(1|2|4|5)(?:$|-)/.test(name) && !/(codex|pro)/.test(name)) return "none";
+  if (/^(gpt-5|o[134])/.test(name) || /codex/.test(name)) return "low";
+  return undefined;
+}
+
+export function responsesBody(model, instructions, input, useReasoning = true) {
+  const body = { model, instructions, input: [{ role: "user", content: input }] };
+  const effort = useReasoning ? reasoningEffortForModel(model) : undefined;
+  if (effort) body.reasoning = { effort };
+  return body;
+}
+
 export async function decide(snapshot, level, config, signal) {
   const { apiKey, baseUrl, model } = config;
   if (!apiKey || !baseUrl || !model) throw new Error("需要 API Key、Base URL 和 Model");
@@ -135,7 +159,13 @@ export async function decide(snapshot, level, config, signal) {
   const instruction = `${PROMPTS[level] ?? PROMPTS.experienced}只依据提供的牌局事实决策，不假设对手风格或不可见信息。只输出 JSON，例如 {"action":"call"} 或 {"action":"raise","amount":10}。amount 是本轮总下注额，必须遵循 legal。`;
   let result;
   try {
-    const data = await request(apiUrl(baseUrl, "responses"), { model, instructions: instruction, input: [{ role: "user", content: input }] }, config, signal);
+    let data;
+    try {
+      data = await request(apiUrl(baseUrl, "responses"), responsesBody(model, instruction, input, true), config, signal);
+    } catch (err) {
+      if (err.status !== 400 || !reasoningEffortForModel(model)) throw err;
+      data = await request(apiUrl(baseUrl, "responses"), responsesBody(model, instruction, input, false), config, signal);
+    }
     result = data.output_text ?? data.output?.flatMap((o) => o.content ?? []).filter((c) => c.type === "output_text").map((c) => c.text).join("");
   } catch (err) {
     if (![400, 404, 405, 501].includes(err.status)) throw err;

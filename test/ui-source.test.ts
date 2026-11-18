@@ -75,6 +75,8 @@ describe("client UI source (shipped public assets)", () => {
     assert.match(html, /id="btn-leave"/);
     assert.match(html, /id="btn-ai"[^>]*desktop-only[\s\S]*id="btn-ai-label">AI玩家/);
     assert.match(html, /id="ai-modal"/);
+    assert.match(html, /id="ai-add-preset"/);
+    assert.match(html, /id="ai-bot-preset"/);
     assert.match(html, /id="ai-use-proxy"/);
     assert.match(html, /id="ai-api-key" type="text"/);
     assert.match(html, /value="tom_dwan">Tom Dwan</);
@@ -150,8 +152,10 @@ describe("client UI source (shipped public assets)", () => {
     assert.match(manager, /type:\s*"sit"/);
     assert.match(manager, /type:\s*"stand"/);
     assert.match(manager, /type:\s*"action"/);
+    assert.match(manager, /addPresetBots/);
     assert.match(manager, /proxyOrigin:\s*await this\.getApiOrigin\(\)/);
     assert.match(core, /export async function decide/);
+    assert.match(core, /reasoningEffortForModel/);
     assert.match(core, /effectiveStacksBB/);
     assert.match(core, /streetActions/);
     assert.doesNotMatch(cli, /agent-core|ai-agents/);
