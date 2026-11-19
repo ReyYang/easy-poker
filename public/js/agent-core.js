@@ -120,13 +120,15 @@ export function modelTransport(url, body, config) {
   return { url: `${config.proxyOrigin.replace(/\/$/, "")}/api/model-proxy`, body: { url, body } };
 }
 
+export const MODEL_TIMEOUT_MS = 25_000;
+
 async function request(url, body, config, signal) {
   const transport = modelTransport(url, body, config);
   const res = await fetch(transport.url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey}` },
     body: JSON.stringify(transport.body),
-    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]) : AbortSignal.timeout(MODEL_TIMEOUT_MS),
   });
   const text = await res.text();
   let data;
@@ -139,7 +141,7 @@ async function request(url, body, config, signal) {
 export function reasoningEffortForModel(model) {
   const name = String(model ?? "").trim().toLowerCase();
   if (!name) return undefined;
-  // Prefer minimal latency on reasoning models so decisions fit inside the 8s/10s turn clock.
+  // Prefer minimal latency on reasoning models so decisions fit inside the 25s/30s turn clock.
   if (/^gpt-5\.(1|2|4|5)(?:$|-)/.test(name) && !/(codex|pro)/.test(name)) return "none";
   if (/^(gpt-5|o[134])/.test(name) || /codex/.test(name)) return "low";
   return undefined;

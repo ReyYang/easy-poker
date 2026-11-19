@@ -26,6 +26,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
   if (url.pathname === "/api/model-proxy" && request.method === "POST") {
     return modelProxy(request);
   }
+  if (url.pathname === "/api/ai-log" && request.method === "POST") {
+    return logAiFallback(request);
+  }
   if (url.pathname === "/api/tables" && request.method === "POST") {
     return createTable(request, env);
   }
@@ -72,9 +75,12 @@ export function modelProxyUrl(value: unknown): URL {
 export async function modelProxy(request: Request): Promise<Response> {
   const authorization = request.headers.get("authorization") ?? "";
   if (!/^Bearer\s+\S+$/i.test(authorization)) return Response.json({ error: "missing_api_key" }, { status: 401 });
+  const startedAt = Date.now();
+  let target = "";
   try {
     const payload = await request.json<{ url?: unknown; body?: unknown }>();
     const url = modelProxyUrl(payload.url);
+    target = `${url.host}${url.pathname}`;
     if (!payload.body || typeof payload.body !== "object") throw new Error("模型请求内容无效");
     // ponytail: arbitrary HTTPS model hosts are intentional for private use; add auth/rate limits before public exposure.
     const upstream = await fetch(url, {
@@ -85,13 +91,36 @@ export async function modelProxy(request: Request): Promise<Response> {
       signal: request.signal,
     });
     if (upstream.status >= 300 && upstream.status < 400) throw new Error("模型代理不允许重定向");
+    const elapsedMs = Date.now() - startedAt;
+    if (!upstream.ok || elapsedMs > 5000) {
+      console.warn("[model-proxy]", JSON.stringify({ target, status: upstream.status, elapsedMs }));
+    }
     return new Response(upstream.body, {
       status: upstream.status,
       headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
     });
   } catch (err) {
-    return Response.json({ error: "model_proxy_error", message: (err as Error).message }, { status: 400 });
+    const message = (err as Error).message;
+    console.warn("[model-proxy]", JSON.stringify({ target, error: message, elapsedMs: Date.now() - startedAt }));
+    return Response.json({ error: "model_proxy_error", message }, { status: 400 });
   }
+}
+
+async function logAiFallback(request: Request): Promise<Response> {
+  try {
+    const body = (await request.json()) as Record<string, unknown>;
+    console.warn("[ai-fallback]", JSON.stringify({
+      tableNumber: String(body.tableNumber ?? "").slice(0, 16),
+      nickname: String(body.nickname ?? "").slice(0, 24),
+      model: String(body.model ?? "").slice(0, 48),
+      reason: String(body.reason ?? "").slice(0, 24),
+      fallback: String(body.fallback ?? "").slice(0, 16),
+      elapsedMs: Number(body.elapsedMs) || 0,
+    }));
+  } catch {
+    /* ignore malformed telemetry */
+  }
+  return new Response(null, { status: 204 });
 }
 
 function withCors(request: Request, res: Response): Response {

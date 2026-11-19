@@ -31,7 +31,7 @@ export function wsUrl(base, tableNumber, playerId) {
   return url.toString();
 }
 
-async function request(url, body, key, timeout = 8000) {
+async function request(url, body, key, timeout = 25000) {
   const res = await fetch(url, {
     method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
     body: JSON.stringify(body), signal: AbortSignal.timeout(timeout),

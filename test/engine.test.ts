@@ -592,7 +592,8 @@ describe("hand / street / pots / timeout", () => {
     assert.equal(table.players.get("c")!.chips, 0);
   });
 
-  it("10s timeout with injected clock folds and shows uncontested settlement", () => {
+  it("30s timeout with injected clock folds and shows uncontested settlement", () => {
+    assert.equal(ACTION_MS, 30_000);
     const { table, clk } = open();
     joinSit(table, "a", "A");
     joinSit(table, "b", "B");

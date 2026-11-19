@@ -83,7 +83,7 @@ export class TableDO {
   async alarm(): Promise<void> {
     const table = await this.load();
     if (!table) return;
-    table.tick();
+    tickWithLog(table);
     if (!table.hand && table.canStartHand()) {
       table.startHand();
     }
@@ -130,7 +130,7 @@ export class TableDO {
     const playerId = String(body.playerId ?? "");
     const nickname = String(body.nickname ?? "");
     try {
-      table.tick();
+      tickWithLog(table);
       switch (type) {
         case "join":
           table.addPlayer(playerId, nickname, String(body.password ?? ""));
@@ -188,7 +188,7 @@ export class TableDO {
   private async loadAndTick(): Promise<Table | null> {
     const table = await this.load();
     if (!table) return null;
-    table.tick();
+    tickWithLog(table);
     return table;
   }
 
@@ -220,6 +220,25 @@ export class TableDO {
     }
     await this.ctx.storage.setAlarm(when);
   }
+}
+
+function tickWithLog(table: Table): void {
+  const actorId = table.hand?.actingPlayerId;
+  const expired = Boolean(actorId && table.hand?.actionDeadline != null && Date.now() >= table.hand.actionDeadline);
+  table.tick();
+  if (!expired || !actorId) return;
+  const timeoutEvent = table.events.find((e) => e.type === "timeout" && e.playerId === actorId);
+  if (!timeoutEvent) return;
+  const actionEvent = table.events.find((e) => (e.type === "check" || e.type === "fold") && e.playerId === actorId);
+  const player = table.players.get(actorId);
+  console.warn("[table-timeout]", JSON.stringify({
+    tableNumber: table.tableNumber,
+    playerId: actorId,
+    nickname: player?.nickname ?? "",
+    action: actionEvent?.type ?? "fold",
+    timeoutStreak: player?.timeoutStreak ?? 0,
+    sitting: Boolean(player?.sitting),
+  }));
 }
 
 function json(data: unknown, status = 200): Response {

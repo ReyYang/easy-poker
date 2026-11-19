@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { agentContext, apiUrl, decide, gameWsUrl, legalMove, modelTransport, PRESET_BOTS, PROMPTS, reasoningEffortForModel, responsesBody } from "../public/js/agent-core.js";
+import { agentContext, apiUrl, decide, gameWsUrl, legalMove, MODEL_TIMEOUT_MS, modelTransport, PRESET_BOTS, PROMPTS, reasoningEffortForModel, responsesBody } from "../public/js/agent-core.js";
 
 test("browser AI clamps model output to the legal action", () => {
   const legal = { canFold: true, canCheck: false, canCall: true, canBet: false, canRaise: true, canAllIn: true, minRaiseTo: 8, maxRaiseTo: 100 };
@@ -60,6 +60,7 @@ test("browser AI selects low-latency reasoning effort only for reasoning models"
   assert.equal("reasoning" in responsesBody("gpt-5.3-codex", "sys", "in", false), false);
   assert.equal("reasoning" in responsesBody("deepseek-chat", "sys", "in"), false);
   assert.equal(PRESET_BOTS.length, 5);
+  assert.equal(MODEL_TIMEOUT_MS, 25_000);
 });
 
 test("browser AI retries responses without reasoning before falling back to chat completions", async () => {

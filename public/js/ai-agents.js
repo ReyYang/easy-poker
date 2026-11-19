@@ -365,6 +365,7 @@ export class BrowserAiAgents {
     const profile = this.profiles.find((item) => item.id === runtime.bot.profileId);
     let move;
     let modelError = false;
+    const startedAt = Date.now();
     try {
       if (!profile?.apiKey) throw new Error("模型配置无法解密");
       const config = profile.useProxy ? { ...profile, proxyOrigin: await this.getApiOrigin() } : profile;
@@ -373,7 +374,11 @@ export class BrowserAiAgents {
       if (runtime.stopped || err.name === "AbortError") return;
       modelError = true;
       move = legalMove({}, snapshot.legal);
-      this.setStatus(runtime, "连接异常", "模型请求失败");
+      const reason = err.name === "TimeoutError" ? "model_timeout" : "model_error";
+      const elapsedMs = Date.now() - startedAt;
+      console.warn("[ai-fallback]", { tableNumber: this.tableNumber, nickname: runtime.bot.nickname, model: profile?.model ?? "", reason, fallback: move.action, elapsedMs });
+      void this.reportAiFallback({ nickname: runtime.bot.nickname, model: profile?.model ?? "", reason, fallback: move.action, elapsedMs });
+      this.setStatus(runtime, "连接异常", reason === "model_timeout" ? "模型请求超时" : "模型请求失败");
     } finally {
       runtime.abortController = null;
     }
@@ -403,6 +408,20 @@ export class BrowserAiAgents {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw Object.assign(new Error(data.message || data.error || "请求失败"), data);
     return data;
+  }
+
+  async reportAiFallback(detail) {
+    try {
+      const origin = await this.getApiOrigin();
+      await fetch(`${origin}/api/ai-log`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tableNumber: this.tableNumber, ...detail }),
+        keepalive: true,
+      });
+    } catch {
+      /* telemetry is best-effort */
+    }
   }
 
   setStatus(runtime, status, error = "") {

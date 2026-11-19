@@ -137,7 +137,7 @@ easy-poker.ai.tables.v1
 6. 使用现有 `legalMove` 约束模型输出，模型失败时执行安全行动。
 7. 再次确认仍是同一手、同一街道和同一行动截止时间，然后通过现有 `action` API 提交。
 
-每个 AI 使用独立的 `busy` 和 `lastTurn`，避免 WebSocket 重复消息触发多次模型调用。模型请求设置 8 秒超时；移除 AI 时通过 `AbortController` 取消未完成请求。
+每个 AI 使用独立的 `busy` 和 `lastTurn`，避免 WebSocket 重复消息触发多次模型调用。模型请求设置 25 秒超时；移除 AI 时通过 `AbortController` 取消未完成请求。
 
 两人 All-in 的发牌次数选择沿用现有 Agent 行为，默认选择一次。
 
