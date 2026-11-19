@@ -57,4 +57,4 @@ const apiInspector = await pickPort(9229);
 const webInspector = await pickPort(apiInspector + 1);
 console.log(`[dev] api http://127.0.0.1:${apiPort}, web http://127.0.0.1:${webPort}`);
 run("api", ["dev", "--config", "wrangler.toml", "--port", String(apiPort), "--inspector-port", String(apiInspector)]);
-run("web", ["dev", "--config", "wrangler.web.toml", "--port", String(webPort), "--inspector-port", String(webInspector), "--var", `API_ORIGIN:http://127.0.0.1:${apiPort}`]);
+run("web", ["dev", "--config", "wrangler.web.toml", "--persist-to", ".wrangler/state-web", "--port", String(webPort), "--inspector-port", String(webInspector), "--var", `API_ORIGIN:http://127.0.0.1:${apiPort}`]);
