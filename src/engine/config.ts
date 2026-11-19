@@ -20,6 +20,10 @@ export function normalizeConfig(input: CreateTableInput): TableConfig {
   if (!Number.isInteger(smallBlind) || smallBlind < 1 || bigBlind !== smallBlind * 2) {
     throw new PokerError("invalid_blinds", "大盲必须是小盲的两倍");
   }
+  const ante = input.ante ?? 0;
+  if (!Number.isInteger(ante) || ante < 0) {
+    throw new PokerError("invalid_ante", "前注必须是非负整数");
+  }
   return {
     durationMinutes: input.durationMinutes as DurationMinutes,
     shortDeck: input.shortDeck === true,
@@ -30,6 +34,7 @@ export function normalizeConfig(input: CreateTableInput): TableConfig {
     bounty27Enabled: input.bounty27Enabled !== false,
     smallBlind,
     bigBlind,
+    ante,
   };
 }
 

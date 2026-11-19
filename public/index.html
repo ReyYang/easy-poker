@@ -39,6 +39,26 @@
                 <option value="480">8 小时</option>
               </select>
             </label>
+            <div class="create-grid">
+              <label class="field">
+                <span>盲注级别</span>
+                <select id="blinds">
+                  <option value="1/2">1 / 2（买入 200）</option>
+                  <option value="2/4">2 / 4（买入 400）</option>
+                  <option value="5/10">5 / 10（买入 1,000）</option>
+                  <option value="10/20">10 / 20（买入 2,000）</option>
+                  <option value="25/50">25 / 50（买入 5,000）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>前注（Ante）</span>
+                <select id="ante">
+                  <option value="0">无前注</option>
+                  <option value="0.5">0.5 BB</option>
+                  <option value="1">1 BB</option>
+                </select>
+              </label>
+            </div>
             <label class="check"><input type="checkbox" id="unlimited" /> 无限 buy-in</label>
             <label class="field" id="max-buyin-field">
               <span>最大 buy-in 次数</span>
@@ -75,11 +95,14 @@
             </button>
           </div>
           <div class="top-right">
+            <button type="button" id="btn-history" class="ghost sm">牌谱</button>
             <button type="button" id="btn-stats" class="ghost sm">战绩</button>
             <button type="button" id="btn-ai" class="ghost sm icon-btn desktop-only hidden">
               <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="5" y="7" width="14" height="12" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3v4M8.5 12h.01M15.5 12h.01M9 16h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
               <span id="btn-ai-label">AI玩家</span>
             </button>
+            <button type="button" id="btn-straddle" class="ghost sm hidden">抓头: 开</button>
+            <button type="button" id="btn-sitout" class="ghost sm hidden">暂离</button>
             <button type="button" id="btn-sit" class="primary sm">坐下</button>
             <button type="button" id="btn-rebuy-top" class="ghost sm icon-btn hidden">
               <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>
@@ -89,6 +112,7 @@
               <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><circle cx="12" cy="5" r="2.4" fill="currentColor"/><path d="M9.2 9.2h5.6L16 21h-2.2l-.6-7h-2.4l-.6 7H8.2L9.2 9.2z" fill="currentColor"/></svg>
               起身
             </button>
+            <button type="button" id="btn-end-table" class="ghost sm hidden">提前结算</button>
             <button type="button" id="btn-leave" class="ghost sm icon-btn">
               <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M9 6H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M10 12h10m-4-4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
               退出
@@ -102,6 +126,7 @@
               <div class="center-stack">
                 <div id="street-label" class="street"></div>
                 <div id="pot" class="pot">底池 0</div>
+                <div id="side-pots" class="side-pots"></div>
                 <div id="board" class="board"></div>
                 <div id="banner" class="banner"></div>
                 <div id="countdown" class="countdown"></div>
@@ -155,10 +180,20 @@
       </div>
     </div>
     <div id="stats-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="stats-title">
-      <div class="modal-card stats-card">
-        <h3 id="stats-title">实时战绩</h3>
+      <div class="modal-card stats-card stats-wide">
+        <h3 id="stats-title">实时战绩 · 牌桌数据</h3>
         <div id="stats-table"></div>
         <button type="button" id="stats-close" class="ghost">关闭</button>
+      </div>
+    </div>
+    <div id="history-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="history-title">
+      <div class="modal-card stats-card stats-wide">
+        <div class="ai-modal-head">
+          <h3 id="history-title">最近牌谱</h3>
+          <button type="button" id="history-copy" class="ghost sm">复制最新</button>
+        </div>
+        <div id="history-list" class="history-list"></div>
+        <button type="button" id="history-close" class="ghost">关闭</button>
       </div>
     </div>
     <div id="ai-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title">

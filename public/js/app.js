@@ -26,6 +26,10 @@ const state = {
   raiseOpen: false,
   lastTickSec: null,
   emoteTimer: null,
+  pendingSeat: null,
+  preAction: null,
+  runoutAnim: null,
+  lastRunoutHand: null,
 };
 
 localStorage.setItem("ep.id", state.playerId);
@@ -271,6 +275,47 @@ function clearTableSession() {
   history.replaceState(null, "", u.pathname);
 }
 
+function clearRunoutAnim() {
+  if (state.runoutAnim?.timers) {
+    for (const t of state.runoutAnim.timers) clearTimeout(t);
+  }
+  state.runoutAnim = null;
+}
+
+function activeRunoutStage(snap) {
+  if (!state.runoutAnim || !snap?.lastResult || snap.street) return null;
+  if (state.runoutAnim.handNumber !== snap.lastResult.handNumber) return null;
+  const stages = snap.lastResult.runs?.[0]?.stages;
+  if (!stages?.length) return null;
+  return stages[Math.min(state.runoutAnim.stageIndex, stages.length - 1)] ?? null;
+}
+
+function startRunoutAnim(snap) {
+  clearRunoutAnim();
+  const lr = snap.lastResult;
+  const stages = lr?.runs?.[0]?.stages;
+  if (!lr || !stages || stages.length <= 1) return;
+  state.lastRunoutHand = lr.handNumber;
+  const timers = [];
+  state.runoutAnim = { handNumber: lr.handNumber, stageIndex: 0, timers };
+  let delay = 0;
+  for (let i = 1; i < stages.length; i++) {
+    delay += i === stages.length - 1 ? 1400 : 1100;
+    timers.push(setTimeout(() => {
+      if (!state.runoutAnim || state.runoutAnim.handNumber !== lr.handNumber) return;
+      state.runoutAnim.stageIndex = i;
+      state.visualKey = "";
+      renderTable(state.snapshot);
+    }, delay));
+  }
+  timers.push(setTimeout(() => {
+    if (!state.runoutAnim || state.runoutAnim.handNumber !== lr.handNumber) return;
+    clearRunoutAnim();
+    state.visualKey = "";
+    renderTable(state.snapshot);
+  }, delay + 800));
+}
+
 function applySnapshot(snap) {
   if (!snap) return;
   state.snapshot = snap;
@@ -279,9 +324,19 @@ function applySnapshot(snap) {
   state.password = snap.password;
   saveTableSession();
   if (snap.status === "finished") {
+    clearRunoutAnim();
+    state.preAction = null;
     showSettle(snap);
     playEvents(snap);
     return;
+  }
+  if (snap.street) {
+    clearRunoutAnim();
+  } else if (snap.lastResult?.allInRunout && snap.lastResult.runs?.[0]?.stages?.length > 1 && state.lastRunoutHand !== snap.lastResult.handNumber) {
+    startRunoutAnim(snap);
+  }
+  if (!snap.street || (state.preAction && state.preAction.handNumber !== snap.handNumber)) {
+    state.preAction = null;
   }
   $("gate").classList.add("hidden");
   $("settle-screen").classList.add("hidden");
@@ -291,6 +346,32 @@ function applySnapshot(snap) {
   const nextExpiry = Math.min(...snap.seats.map((s) => s?.reaction?.until ?? Infinity));
   if (Number.isFinite(nextExpiry)) state.emoteTimer = setTimeout(() => renderTable(state.snapshot), Math.max(0, nextExpiry - Date.now() + 25));
   playEvents(snap);
+  maybeRunPreAction(snap);
+}
+
+function maybeRunPreAction(snap) {
+  if (!snap?.legal || state.actionLock || !state.preAction) return;
+  if (state.preAction.handNumber !== snap.handNumber) {
+    state.preAction = null;
+    return;
+  }
+  const pa = state.preAction;
+  state.preAction = null;
+  let action = null;
+  if (pa.type === "check_fold") {
+    action = snap.legal.canCheck ? "check" : "fold";
+  } else if (pa.type === "auto_check") {
+    if (snap.legal.canCheck) action = "check";
+  } else if (pa.type === "call_exact") {
+    if (snap.legal.canCheck) action = "check";
+    else if (snap.legal.canCall && snap.legal.callAmount <= (pa.maxCall ?? 0)) action = "call";
+  }
+  if (action) {
+    setTimeout(() => void cmd({ type: "action", action }), 60);
+  } else {
+    state.visualKey = "";
+    renderTable(snap);
+  }
 }
 
 function playEvents(snap) {
@@ -317,21 +398,28 @@ function playEvents(snap) {
 }
 
 function visualKey(snap) {
+  const stage = activeRunoutStage(snap);
   return JSON.stringify({
     h: snap.handNumber,
     street: snap.street,
     board: snap.board,
     holes: snap.me?.holeCards,
+    heroHand: snap.me?.heroHandName,
     acting: snap.actingPlayerId,
     pot: snap.pot,
+    sidePots: snap.sidePots,
     legal: snap.legal,
     last: snap.lastResult,
     next: snap.nextHandAt,
     vote: snap.runoutVote,
+    stage: stage ? [stage.street, stage.board.length] : null,
+    pre: state.preAction,
+    sittingOut: snap.me?.sittingOut,
+    autoStraddle: snap.me?.autoStraddle,
     portrait: isPortraitTable(),
     seats: snap.seats.map((s) =>
       s
-        ? [s.playerId, s.chips, s.pendingChips, s.bet, s.folded, s.acting, s.holeCards, s.isButton, s.isSb, s.isBb, s.sitting, s.reaction?.until > Date.now() ? s.reaction : null]
+        ? [s.playerId, s.chips, s.pendingChips, s.bet, s.folded, s.acting, s.holeCards, s.isButton, s.isSb, s.isBb, s.isStraddle, s.hasSquid, s.sitting, s.sittingOut, s.lastAction, s.stats?.handsDealt, s.stats?.vpip, s.reaction?.until > Date.now() ? s.reaction : null]
         : null,
     ),
   });
@@ -344,19 +432,41 @@ function renderTable(snap) {
   $("btn-sit").classList.toggle("hidden", sitting);
   $("btn-stand").classList.toggle("hidden", !sitting);
   $("btn-rebuy-top").classList.toggle("hidden", !sitting);
+  const straddleBtn = $("btn-straddle");
+  if (straddleBtn) {
+    straddleBtn.classList.toggle("hidden", !sitting || !snap.config.straddleAllowed);
+    straddleBtn.textContent = snap.me?.autoStraddle === false ? "抓头: 关" : "抓头: 开";
+  }
+  const sitoutBtn = $("btn-sitout");
+  if (sitoutBtn) {
+    sitoutBtn.classList.toggle("hidden", !sitting);
+    sitoutBtn.textContent = snap.me?.sittingOut ? "回到座位" : "暂离";
+  }
   const host = isAiHost(snap.tableNumber);
   $("btn-ai").classList.toggle("hidden", !host);
+  const endBtn = $("btn-end-table");
+  if (endBtn) endBtn.classList.toggle("hidden", !host || snap.status === "finished");
   if (host) void aiAgents.attach(snap.tableNumber, snap.password).catch(() => toast("AI 配置读取失败"));
   else if (aiAgents.tableNumber) aiAgents.detach();
   const key = visualKey(snap);
   if (key !== state.visualKey) {
     state.visualKey = key;
     renderSeats(snap);
-    $("felt").classList.toggle("is-showdown", Boolean(snap.lastResult && !snap.street && snap.nextHandAt));
+    const stage = activeRunoutStage(snap);
+    $("felt").classList.toggle("is-showdown", Boolean(!stage && snap.lastResult && !snap.street && snap.nextHandAt));
     $("street-label").textContent = !snap.street && !snap.nextHandAt ? "等待开局" : "";
     $("pot").innerHTML = snap.pot ? chipStackHTML(snap.pot) : `<span class="chip-amt">底池 0</span>`;
+    const sidePotsEl = $("side-pots");
+    if (sidePotsEl) {
+      const pots = snap.sidePots || [];
+      sidePotsEl.innerHTML = pots.length > 1
+        ? pots.map((p, i) => `<span class="side-pot-pill">${i === 0 ? "主池" : `边池${i}`} ${fmtChips(p.amount)}</span>`).join("")
+        : "";
+    }
     const bannerBits = [];
-    if (snap.lastResult?.winners?.length && !snap.street && snap.nextHandAt) {
+    if (stage) {
+      bannerBits.push("All-In 跑牌中（轻触牌桌跳过）");
+    } else if (snap.lastResult?.winners?.length && !snap.street && snap.nextHandAt) {
       bannerBits.push(
         snap.lastResult.winners
           .filter((w) => w.amount > 0)
@@ -366,7 +476,10 @@ function renderTable(snap) {
       if (snap.me?.sitting && snap.me.chips === 0) bannerBits.push("筹码为 0，补码后从下一手参与");
     }
     $("banner").textContent = bannerBits.join(" · ");
-    const flags = [snap.config.shortDeck ? "短牌 6-A · 同花>葫芦" : "长牌 2-A"];
+    const flags = [
+      `盲注 ${snap.config.smallBlind}/${snap.config.bigBlind}${snap.config.ante ? ` 前注${snap.config.ante}` : ""}`,
+      snap.config.shortDeck ? "短牌 6-A · 同花>葫芦" : "长牌 2-A",
+    ];
     if (snap.config.straddleAllowed) flags.push("Straddle");
     if (snap.config.squidEnabled) flags.push("鱿鱼");
     if (snap.config.bounty27Enabled) flags.push("27杂色·翻牌后逼退·5BB/人");
@@ -384,6 +497,9 @@ function renderSeats(snap) {
   const root = $("seats");
   const meSeat = snap.me?.seat ?? 0;
   const sitting = Boolean(snap.me?.sitting);
+  const canPickSeat = !sitting || !snap.street || snap.me?.folded || snap.me?.sittingOut;
+  const stage = activeRunoutStage(snap);
+  const maxEq = stage?.equities ? Math.max(-1, ...Object.values(stage.equities)) : -1;
   if (root.children.length !== SEATS) {
     root.innerHTML = "";
     for (let i = 0; i < SEATS; i++) {
@@ -401,36 +517,64 @@ function renderSeats(snap) {
     el.style.top = `${pos.y}%`;
     for (let v = 0; v < SEATS; v++) el.classList.toggle(`vis-${v}`, v === vis);
     const s = snap.seats[seat];
+    const eqVal = s && !s.folded ? stage?.equities?.[s.playerId] : undefined;
+    const eqOuts = s && !s.folded ? stage?.outs?.[s.playerId] : undefined;
     const key = s
-      ? `${s.playerId}|${s.chips}|${s.pendingChips}|${s.bet}|${s.folded}|${s.acting}|${(s.holeCards || []).join("")}|${s.isButton}|${s.isSb}|${s.isBb}|${s.reaction?.until > Date.now() ? s.reaction.until : ""}`
-      : "empty";
+      ? `${s.playerId}|${s.chips}|${s.pendingChips}|${s.bet}|${s.folded}|${s.sittingOut ? 1 : 0}|${s.acting}|${(s.holeCards || []).join(",")}|${s.isButton}|${s.isSb}|${s.isBb}|${s.isStraddle}|${s.hasSquid}|${s.lastAction?.label || ""}|${s.stats?.handsDealt || 0}|${s.stats?.vpip || 0}|${stage ? 1 : 0}|${eqVal ?? ""}|${eqOuts ?? ""}|${s.reaction?.until > Date.now() ? s.reaction.until : ""}`
+      : `empty|${seat}|${canPickSeat ? (sitting ? "move" : "sit") : "plain"}`;
     if (el.dataset.key === key) continue;
     el.dataset.key = key;
-    el.className =
-      `seat vis-${vis}` +
-      (s?.acting ? " acting" : "") +
-      (s?.folded ? " folded" : "") +
-      (s?.chips === 0 && s?.sitting ? " busted" : "") +
-      (s?.playerId === snap.me?.id ? " me" : "");
     if (!s) {
-      el.innerHTML = `<div class="avatar">空</div><div class="name">空位</div>`;
+      el.className = `seat vis-${vis} empty-seat${canPickSeat ? " pickable" : ""}`;
+      if (canPickSeat) {
+        el.dataset.seatPick = String(seat);
+        el.setAttribute("role", "button");
+        el.setAttribute("tabindex", "0");
+        el.setAttribute("aria-label", `${sitting ? "换到" : "坐入"} ${seat + 1} 号位`);
+        el.innerHTML = `<div class="avatar">${sitting ? "换座" : "入座"}</div><div class="name">${seat + 1}号位</div>`;
+      } else {
+        delete el.dataset.seatPick;
+        el.removeAttribute("role");
+        el.removeAttribute("tabindex");
+        el.removeAttribute("aria-label");
+        el.innerHTML = `<div class="avatar">空</div><div class="name">空位</div>`;
+      }
       continue;
     }
+    delete el.dataset.seatPick;
+    el.removeAttribute("role");
+    el.removeAttribute("tabindex");
+    el.removeAttribute("aria-label");
+    el.className =
+      `seat vis-${vis}` +
+      (s.acting ? " acting" : "") +
+      (s.folded ? " folded" : "") +
+      (s.sittingOut ? " sitting-out" : "") +
+      (s.chips === 0 && s.sitting ? " busted" : "") +
+      (s.playerId === snap.me?.id ? " me" : "");
     const badges = [
       s.isButton ? '<i class="role-badge dealer">D</i>' : "",
       s.isSb ? '<i class="role-badge sb">SB</i>' : "",
       s.isBb ? '<i class="role-badge bb">BB</i>' : "",
       s.isStraddle ? '<i class="role-badge str">STR</i>' : "",
     ].join("");
+    const eqBadge = eqVal != null
+      ? `<span class="equity-badge${eqVal === maxEq && maxEq > 0 ? " lead" : ""}">${eqVal}%${eqOuts > 0 && eqVal < maxEq ? ` (${eqOuts}outs)` : ""}</span>`
+      : "";
     const squid = s.hasSquid ? "🦑" : "";
     const holes =
-      s.holeCards && s.playerId !== snap.me?.id ? s.holeCards.map((c) => cardHTML(c, "tiny")).join("") : "";
+      s.holeCards && (s.playerId !== snap.me?.id || stage) ? s.holeCards.map((c) => cardHTML(c, "tiny")).join("") : "";
     const pending = s.pendingChips ? ` <span class="pending">+${fmtChips(s.pendingChips)}</span>` : "";
-    const broke = s.sitting && s.chips === 0 && !s.pendingChips ? " · 待补码" : "";
+    const statusNote = s.sittingOut ? " · 暂离" : s.sitting && s.chips === 0 && !s.pendingChips ? " · 待补码" : "";
+    const actCls = s.lastAction?.type || "";
+    const actionTag = s.lastAction?.label ? `<div class="action-tag ${actCls}">${escapeHtml(s.lastAction.label)}</div>` : "";
+    const hudMini = s.stats?.handsDealt ? `<div class="hud-mini">VPIP ${s.stats.vpip}% · PFR ${s.stats.pfr}%</div>` : "";
     el.innerHTML = `
-        <div class="avatar" ${s.playerId === snap.me?.id ? 'role="button" tabindex="0" aria-label="选择表情"' : ""}>${s.acting ? '<i class="timer-ring"></i>' : ""}<span class="seat-initial">${escapeHtml(s.nickname.slice(0, 1))}</span><b class="seat-cd"></b>${badges}${s.reaction?.until > Date.now() ? `<span class="emote-bubble">${s.reaction.emoji}</span>` : ""}</div>
+        <div class="avatar" ${s.playerId === snap.me?.id ? 'role="button" tabindex="0" aria-label="选择表情"' : ""}>${s.acting ? '<i class="timer-ring"></i>' : ""}${eqBadge}<span class="seat-initial">${escapeHtml(s.nickname.slice(0, 1))}</span><b class="seat-cd"></b>${badges}${s.reaction?.until > Date.now() ? `<span class="emote-bubble">${s.reaction.emoji}</span>` : ""}</div>
         <div class="name">${escapeHtml(s.nickname)}${squid}</div>
-        <div class="stack">${fmtChips(s.chips)}${pending}${broke}</div>
+        <div class="stack">${fmtChips(s.chips)}${pending}${statusNote}</div>
+        ${actionTag}
+        ${hudMini}
         <div class="bet">${s.bet ? chipStackHTML(s.bet) : ""}</div>
         <div class="seat-cards">${holes}</div>`;
   }
@@ -441,8 +585,9 @@ function queuedCount(where) {
 }
 
 function queueDeals(snap) {
+  const stage = activeRunoutStage(snap);
   const holes = snap.me?.holeCards ?? [];
-  const board = snap.board ?? [];
+  const board = stage ? stage.board : (snap.board ?? []);
   const hn = snap.handNumber;
   const handEnded = Boolean(snap.lastResult && !snap.street);
   const meFolded = snap.seats.some((s) => s?.playerId === snap.me?.id && s.folded);
@@ -469,6 +614,13 @@ function queueDeals(snap) {
     for (let i = state.shownHoles.length + queuedCount("hole"); i < holes.length; i++) {
       state.dealQueue.push({ where: "hole", card: holes[i] });
     }
+    const existingBadge = $("hole").querySelector(".hero-hand-badge");
+    if (snap.me?.heroHandName && holes.length === 2 && board.length >= 3) {
+      if (existingBadge) existingBadge.textContent = snap.me.heroHandName;
+      else $("hole").insertAdjacentHTML("beforeend", `<span class="hero-hand-badge">${escapeHtml(snap.me.heroHandName)}</span>`);
+    } else if (existingBadge) {
+      existingBadge.remove();
+    }
   }
   for (let i = state.shownBoard.length + queuedCount("board"); i < board.length; i++) {
     state.dealQueue.push({ where: "board", card: board[i] });
@@ -483,7 +635,8 @@ function pumpDeal() {
   state.dealBusy = true;
   play("deal");
   const wrap = item.where === "hole" ? $("hole") : $("board");
-  wrap.insertAdjacentHTML("beforeend", cardHTML(item.card, "deal-anim"));
+  const peel = item.where === "board" && state.shownBoard.length === 4 && state.runoutAnim ? "river-peel" : "deal-anim";
+  wrap.insertAdjacentHTML("beforeend", cardHTML(item.card, peel));
   if (item.where === "hole") state.shownHoles.push(item.card);
   else state.shownBoard.push(item.card);
   setTimeout(() => {
@@ -495,7 +648,7 @@ function pumpDeal() {
 function renderShowdown(snap) {
   const box = $("showdown");
   if (!box) return;
-  if (!snap.lastResult || snap.street || !snap.nextHandAt) {
+  if (activeRunoutStage(snap) || !snap.lastResult || snap.street || !snap.nextHandAt) {
     box.classList.add("hidden");
     if (snap.street || !snap.nextHandAt) state.showdownHand = null;
     return;
@@ -520,9 +673,11 @@ function renderShowdown(snap) {
     })
     .join("");
   const winIds = new Set(lr.winners.filter((w) => w.amount > 0).map((w) => w.id));
+  const mucked = new Set(lr.muckedIds || []);
   const ids = new Set([
     ...Object.keys(lr.shown || {}),
     ...lr.winners.map((w) => w.id),
+    ...(lr.muckedIds || []),
     ...(lr.foldedIds || []),
   ]);
   $("sd-players").innerHTML = [...ids]
@@ -530,9 +685,10 @@ function renderShowdown(snap) {
       const win = winIds.has(id);
       const folded = (lr.foldedIds || []).includes(id);
       const timed = (lr.timeoutIds || []).includes(id);
+      const isMucked = mucked.has(id);
       const cards = lr.shown?.[id] || [];
       const hn2 = lr.winners.find((w) => w.id === id)?.handName || "";
-      const tag = timed ? " · 超时弃牌" : folded && !win ? " · 弃牌" : hn2 ? " · " + hn2 : "";
+      const tag = timed ? " · 超时弃牌" : folded && !win ? " · 弃牌" : isMucked && !win ? " · 盖牌" : hn2 ? " · " + hn2 : "";
       const holes = cards.length ? cards.map((c) => cardHTML(c, "tiny")).join("") : "";
       return `<div class="sd-row ${win ? "winner" : ""}"><div class="name">${escapeHtml(nameOf(snap, id))}${tag}</div><div class="sd-holes">${holes}</div></div>`;
     })
@@ -621,14 +777,25 @@ function squidEventText(snap) {
     .join("　");
 }
 
+function cardText(card) {
+  if (!card) return "";
+  return `${card[0] === "T" ? "10" : card[0]}${SUIT[card[1]] ?? ""}`;
+}
+
 function bindRaiseSlider() {
   const sl = $("raise-amt");
+  const num = $("raise-num");
   const lab = $("raise-val");
   const btn = document.querySelector("#actions button[data-act='bet'], #actions button[data-act='raise']");
   if (!sl || !lab || !btn) return;
-  const paint = () => {
-    const n = Number(sl.value);
-    const allIn = n === Number(sl.max);
+  const paint = (fromNum = false) => {
+    const min = Number(sl.min);
+    const max = Number(sl.max);
+    const raw = fromNum && num ? Number(num.value) : Number(sl.value);
+    const n = Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.round(raw))) : min;
+    if (fromNum) sl.value = String(n);
+    else if (num) num.value = String(n);
+    const allIn = n === max;
     lab.textContent = fmtChips(n);
     const amount = btn.querySelector("[data-submit-amount]");
     const label = btn.querySelector("[data-submit-label]");
@@ -641,10 +808,14 @@ function bindRaiseSlider() {
     }
   };
   sl.addEventListener("input", () => {
-    document.querySelectorAll("#actions [data-preset]").forEach((button) => button.classList.remove("selected"));
-    paint();
+    document.querySelectorAll("#actions [data-preset], #actions [data-bb-mult]").forEach((button) => button.classList.remove("selected"));
+    paint(false);
   });
-  paint();
+  num?.addEventListener("change", () => {
+    document.querySelectorAll("#actions [data-preset], #actions [data-bb-mult]").forEach((button) => button.classList.remove("selected"));
+    paint(true);
+  });
+  paint(false);
 }
 
 function renderActions(snap) {
@@ -668,20 +839,40 @@ function renderActions(snap) {
   if (!legal) {
     state.raiseOpen = false;
     const extras = [];
-    if (snap.me?.holeCards && snap.lastResult && !snap.street && snap.nextHandAt && !snap.lastResult.shown?.[snap.me.id]) {
+    const shownArr = snap.lastResult?.shown?.[snap.me?.id] || [];
+    const shownCount = shownArr.filter(Boolean).length;
+    if (snap.me?.holeCards?.length === 2 && snap.lastResult && !snap.street && snap.nextHandAt && shownCount < 2) {
+      const [c0, c1] = snap.me.holeCards;
+      if (!shownArr[0]) extras.push(`<button type="button" data-show-idx="0" class="ghost">秀 ${cardText(c0)}</button>`);
+      if (!shownArr[1]) extras.push(`<button type="button" data-show-idx="1" class="ghost">秀 ${cardText(c1)}</button>`);
       extras.push(`<button type="button" data-act="show" class="ghost">亮牌</button>`);
+    }
+    const meSeat = snap.seats.find((s) => s?.playerId === snap.me?.id);
+    if (!extras.length && snap.street && meSeat && meSeat.inHand && !meSeat.folded && !meSeat.allIn) {
+      const currentBet = Math.max(0, ...snap.seats.map((s) => s?.bet ?? 0));
+      const toCall = Math.max(0, currentBet - meSeat.bet);
+      const curPre = state.preAction?.handNumber === snap.handNumber ? state.preAction.type : "";
+      extras.push(
+        `<div class="pre-action-bar">` +
+        `<button type="button" data-pre="check_fold" class="${curPre === "check_fold" ? "active" : ""}">过牌/弃牌</button>` +
+        (toCall === 0 ? `<button type="button" data-pre="auto_check" class="${curPre === "auto_check" ? "active" : ""}">自动过牌</button>` : "") +
+        (toCall > 0 ? `<button type="button" data-pre="call_exact" data-pre-call="${toCall}" class="${curPre === "call_exact" ? "active" : ""}">跟注 ${fmtChips(Math.min(toCall, meSeat.chips))}</button>` : "") +
+        `</div>`,
+      );
     }
     const waitText =
       snap.me?.sitting && snap.me.chips === 0
         ? "未补码，不参与下一手"
-        : !snap.street && !snap.nextHandAt
-          ? "等待开局"
-          : snap.lastResult && !snap.street
-            ? "摊牌结算中"
-            : snap.me?.sitting
-              ? "等待行动"
-              : "观战中，坐下后可参与下一手";
-    box.innerHTML = extras.join("") || `<span class="muted">${waitText}</span>`;
+        : snap.me?.sittingOut
+          ? "暂离中，点击顶部「回座」继续"
+          : !snap.street && !snap.nextHandAt
+            ? "等待开局"
+            : snap.lastResult && !snap.street
+              ? "摊牌结算中"
+              : snap.me?.sitting
+                ? "等待行动"
+                : "观战中，点击空位或「坐下」入局";
+    box.innerHTML = extras.length ? `<div class="show-bar">${extras.join("")}</div>` : `<span class="muted">${waitText}</span>`;
     return;
   }
   const act = legal.canBet ? "bet" : legal.canRaise ? "raise" : "";
@@ -690,10 +881,28 @@ function renderActions(snap) {
   const mobileAmountOpen = Boolean(act && mobile && state.raiseOpen);
   const showAmount = Boolean(act && (!mobile || state.raiseOpen));
   if (!act) state.raiseOpen = false;
+  const isPreflop = snap.street === "preflop";
+  const currentBet = Math.max(0, ...snap.seats.map((s) => s?.bet ?? 0));
+  const facingOpenRaise = isPreflop && currentBet > snap.config.bigBlind;
+  const presetBtns = isPreflop
+    ? [
+        `<button type="button" data-bb-mult="${facingOpenRaise ? "2.5" : "2.2"}">${facingOpenRaise ? "2.5x" : "2.2BB"}</button>`,
+        `<button type="button" data-bb-mult="3">${facingOpenRaise ? "3x" : "3BB"}</button>`,
+        `<button type="button" data-bb-mult="4">${facingOpenRaise ? "4x" : "4BB"}</button>`,
+        `<button type="button" data-preset="1">满池</button>`,
+        legal.canAllIn ? '<button type="button" data-preset="allin">All-in</button>' : "",
+      ].join("")
+    : [
+        `<button type="button" data-preset="0.333333">1/3</button>`,
+        `<button type="button" data-preset="0.5">1/2</button>`,
+        `<button type="button" data-preset="0.666667">2/3</button>`,
+        `<button type="button" data-preset="1">满池</button>`,
+        legal.canAllIn ? '<button type="button" data-preset="allin">All-in</button>' : "",
+      ].join("");
   const amountControls = showAmount
     ? `<div class="amount-controls">
-        <div class="raise-presets"><button type="button" data-preset="0.333333">1/3</button><button type="button" data-preset="0.5">1/2</button><button type="button" data-preset="1">满池</button>${legal.canAllIn ? '<button type="button" data-preset="allin">All-in</button>' : ""}</div>
-        <label class="raise-ctl"><input type="range" id="raise-amt" aria-label="下注额" min="${min}" max="${legal.maxRaiseTo}" value="${min}" /><output id="raise-val">${fmtChips(min)}</output></label>
+        <div class="raise-presets">${presetBtns}</div>
+        <label class="raise-ctl"><input type="range" id="raise-amt" aria-label="下注额" min="${min}" max="${legal.maxRaiseTo}" value="${min}" /><input type="number" id="raise-num" class="raise-num" aria-label="输入下注额" min="${min}" max="${legal.maxRaiseTo}" value="${min}" /><output id="raise-val">${fmtChips(min)}</output></label>
       </div>`
     : "";
   const amount = amountControls && !mobile
@@ -798,6 +1007,10 @@ async function leaveTable() {
   state.password = "";
   state.snapshot = null;
   state.lastEvents = "";
+  clearRunoutAnim();
+  state.preAction = null;
+  state.lastRunoutHand = null;
+  state.pendingSeat = null;
   aiAgents.detach();
   if (state.ws) {
     const ws = state.ws;
@@ -828,10 +1041,46 @@ function showStats(snap) {
   const rows = (snap.standings ?? [])
     .slice()
     .sort((a, b) => b.net - a.net)
-    .map((p, i) => `<tr><td>${i + 1}</td><td>${escapeHtml(p.nickname)}</td><td>${fmtChips(p.stack)}</td><td class="${p.net >= 0 ? "pos" : "neg"}">${p.net >= 0 ? "+" : ""}${fmtChips(p.net)}</td></tr>`)
+    .map((p, i) => {
+      const st = p.stats ?? { handsDealt: 0, vpip: 0, pfr: 0, threeBet: 0, wsd: 0 };
+      return `<tr><td>${i + 1}</td><td>${escapeHtml(p.nickname)}</td><td>${fmtChips(p.stack)}</td><td class="${p.net >= 0 ? "pos" : "neg"}">${p.net >= 0 ? "+" : ""}${fmtChips(p.net)}</td><td>${st.handsDealt}</td><td>${st.vpip}%</td><td>${st.pfr}%</td><td>${st.threeBet}%</td><td>${st.wsd}%</td></tr>`;
+    })
     .join("");
-  $("stats-table").innerHTML = `<table class="settle-table"><thead><tr><th>#</th><th>玩家</th><th>筹码</th><th>净胜负</th></tr></thead><tbody>${rows}</tbody></table>`;
+  $("stats-table").innerHTML = `<table class="settle-table"><thead><tr><th>#</th><th>玩家</th><th>筹码</th><th>净胜负</th><th>手数</th><th>VPIP</th><th>PFR</th><th>3-Bet</th><th>摊牌胜</th></tr></thead><tbody>${rows}</tbody></table>`;
   $("stats-modal").classList.remove("hidden");
+}
+
+function formatHandText(h) {
+  const streetNames = { preflop: "翻前", flop: "翻牌", turn: "转牌", river: "河牌" };
+  const lines = [];
+  for (const st of ["preflop", "flop", "turn", "river"]) {
+    const acts = (h.actions || []).filter((a) => a.street === st);
+    if (!acts.length) continue;
+    const text = acts.map((a) => `${a.nickname} ${a.label}${a.amount ? " " + a.amount : ""}`).join(" → ");
+    lines.push(`${streetNames[st]}：${text}`);
+  }
+  const winText = (h.winners || []).map((w) => `${w.nickname} +${w.amount}${w.handName ? ` (${w.handName})` : ""}`).join("，");
+  return `第 #${h.handNumber} 手 · 底池 ${h.pot}${h.board?.length ? ` · 公共牌 ${h.board.map(cardText).join(" ")}` : ""}\n${lines.join("\n")}\n结果：${winText}`;
+}
+
+function showHistory(snap) {
+  const list = (snap?.history ?? []).slice().reverse();
+  $("history-list").innerHTML = list.length
+    ? list.map((h) => {
+        const streetNames = { preflop: "翻前", flop: "翻牌", turn: "转牌", river: "河牌" };
+        const streetLines = ["preflop", "flop", "turn", "river"].map((st) => {
+          const acts = (h.actions || []).filter((a) => a.street === st);
+          if (!acts.length) return "";
+          const text = acts.map((a) => `${escapeHtml(a.nickname)} ${escapeHtml(a.label)}${a.amount ? " " + fmtChips(a.amount) : ""}`).join(" → ");
+          return `<div><strong>${streetNames[st]}：</strong>${text}</div>`;
+        }).join("");
+        const boardHtml = h.board?.length ? `<div class="history-board">${h.board.map((c) => cardHTML(c, "tiny")).join("")}</div>` : "";
+        const shownHtml = Object.entries(h.shown || {}).map(([id, cards]) => `${escapeHtml(nameOf(snap, id))}: ${cards.filter(Boolean).map(cardText).join(" ")}`).join(" · ");
+        const winText = (h.winners || []).map((w) => `${escapeHtml(w.nickname)} 赢得 ${fmtChips(w.amount)}${w.handName ? ` (${escapeHtml(w.handName)})` : ""}`).join("，");
+        return `<div class="history-item"><div class="history-head"><span>第 #${h.handNumber} 手</span><span>底池 ${fmtChips(h.pot)}</span></div>${boardHtml}<div class="history-lines">${streetLines}</div><div class="history-res">${winText}${shownHtml ? ` · 亮牌 ${shownHtml}` : ""}</div></div>`;
+      }).join("")
+    : '<div class="ai-empty">还没有已完成的手牌记录</div>';
+  $("history-modal").classList.remove("hidden");
 }
 
 function inviteUrl() {
@@ -888,10 +1137,16 @@ $("unlimited").onchange = () => {
 $("create-form").onsubmit = async (e) => {
   e.preventDefault();
   if (!needNick()) return;
+  const [sb, bb] = ($("blinds")?.value || "1/2").split("/").map(Number);
+  const anteRatio = Number($("ante")?.value || 0);
+  const ante = anteRatio > 0 ? Math.max(1, Math.round(bb * anteRatio)) : 0;
   const data = await api("/api/tables", {
     playerId: state.playerId,
     nickname: state.nickname,
     durationMinutes: Number($("duration").value),
+    smallBlind: sb,
+    bigBlind: bb,
+    ante,
     shortDeck: $("short-deck").checked,
     unlimitedBuyin: $("unlimited").checked,
     maxBuyins: Number($("max-buyins").value || 10),
@@ -926,6 +1181,19 @@ $("btn-copy-link").onclick = () => copy(inviteUrl(), "邀请链接已复制");
 $("btn-copy-link-2").onclick = () => copy(inviteUrl(), "邀请链接已复制");
 $("btn-stats").onclick = () => showStats(state.snapshot);
 $("stats-close").onclick = () => $("stats-modal").classList.add("hidden");
+$("btn-history").onclick = () => showHistory(state.snapshot);
+$("history-close").onclick = () => $("history-modal").classList.add("hidden");
+$("history-copy").onclick = () => {
+  const last = state.snapshot?.history?.[state.snapshot.history.length - 1];
+  if (!last) return toast("暂无可复制的牌谱");
+  void copy(formatHandText(last), "最新牌谱已复制");
+};
+$("btn-straddle").onclick = () => void cmd({ type: "autoStraddle", on: state.snapshot?.me?.autoStraddle === false });
+$("btn-sitout").onclick = () => void cmd({ type: "sitOut", sitOut: !state.snapshot?.me?.sittingOut });
+$("btn-end-table").onclick = async () => {
+  if (!await gameConfirm("确定提前结束牌局并生成最终结算吗？", "结束结算")) return;
+  await cmd({ type: "endTable" });
+};
 $("btn-leave").onclick = () => void leaveTable();
 $("btn-leave-2").onclick = () => void leaveTable();
 
@@ -1064,6 +1332,7 @@ function openBuyin(okLabel) {
 }
 
 $("btn-sit").onclick = () => {
+  state.pendingSeat = null;
   const snap = state.snapshot;
   if (snap?.me?.chips > 0) {
     void cmd({ type: "sit", buyinCount: 0 });
@@ -1071,18 +1340,43 @@ $("btn-sit").onclick = () => {
   }
   openBuyin("坐下");
 };
-$("buyin-cancel").onclick = () => $("modal").classList.add("hidden");
+$("buyin-cancel").onclick = () => {
+  state.pendingSeat = null;
+  $("modal").classList.add("hidden");
+};
 $("buyin-ok").onclick = () => {
   $("modal").classList.add("hidden");
   const n = Number($("buyin-n").value || 1);
+  const seat = state.pendingSeat;
+  state.pendingSeat = null;
   if (state.snapshot?.me?.sitting) void cmd({ type: "rebuy", buyinCount: n });
-  else void cmd({ type: "sit", buyinCount: n });
+  else void cmd({ type: "sit", buyinCount: n, ...(seat == null ? {} : { seat }) });
 };
 $("btn-stand").onclick = () => void cmd({ type: "stand" });
 
-$("btn-rebuy-top").onclick = () => openBuyin("补码");
+$("btn-rebuy-top").onclick = () => {
+  state.pendingSeat = null;
+  openBuyin("补码");
+};
 $("emote-picker").innerHTML = EMOJI.map((emoji) => `<button type="button" aria-label="发送 ${emoji}" data-emoji="${emoji}">${emoji}</button>`).join("");
 $("seats").onclick = (e) => {
+  const pickEl = e.target.closest("[data-seat-pick]");
+  if (pickEl) {
+    const seat = Number(pickEl.dataset.seatPick);
+    const snap = state.snapshot;
+    if (snap?.me?.sitting) {
+      void cmd({ type: "changeSeat", seat });
+      return;
+    }
+    state.pendingSeat = seat;
+    if (snap?.me?.chips > 0) {
+      state.pendingSeat = null;
+      void cmd({ type: "sit", buyinCount: 0, seat });
+      return;
+    }
+    openBuyin(`坐 ${seat + 1} 号位`);
+    return;
+  }
   const avatar = e.target.closest(".seat.me .avatar");
   if (!avatar) return;
   const picker = $("emote-picker");
@@ -1091,8 +1385,16 @@ $("seats").onclick = (e) => {
   picker.style.top = `${Math.max(8, rect.top - 170)}px`;
   picker.classList.toggle("hidden");
 };
+$("felt").onclick = (e) => {
+  if (e.target.closest("[data-seat-pick], .seat.me .avatar")) return;
+  if (activeRunoutStage(state.snapshot)) {
+    clearRunoutAnim();
+    state.visualKey = "";
+    renderTable(state.snapshot);
+  }
+};
 $("seats").onkeydown = (e) => {
-  if ((e.key === "Enter" || e.key === " ") && e.target.matches(".seat.me .avatar")) {
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches(".seat.me .avatar, [data-seat-pick]")) {
     e.preventDefault(); e.target.click();
   }
 };
@@ -1103,10 +1405,40 @@ $("emote-picker").onclick = (e) => {
   void cmd({ type: "emote", emoji: button.dataset.emoji });
 };
 $("actions").onclick = (e) => {
+  const preBtn = e.target.closest("button[data-pre]");
+  if (preBtn && state.snapshot) {
+    const type = preBtn.dataset.pre;
+    const same = state.preAction?.handNumber === state.snapshot.handNumber && state.preAction?.type === type;
+    state.preAction = same
+      ? null
+      : { handNumber: state.snapshot.handNumber, type, maxCall: Number(preBtn.dataset.preCall || 0) };
+    state.visualKey = "";
+    renderTable(state.snapshot);
+    return;
+  }
+  const showPart = e.target.closest("button[data-show-idx]");
+  if (showPart) {
+    void cmd({ type: "show", cardIndex: Number(showPart.dataset.showIdx) });
+    return;
+  }
   const closeAmount = e.target.closest("button[data-close-amount]");
   if (closeAmount) {
     state.raiseOpen = false;
     renderActions(state.snapshot);
+    return;
+  }
+  const bbPreset = e.target.closest("button[data-bb-mult]");
+  if (bbPreset) {
+    const slider = $("raise-amt");
+    const snap = state.snapshot;
+    if (!slider || !snap) return;
+    const bb = snap.config.bigBlind;
+    const currentBet = Math.max(0, ...snap.seats.map((s) => s?.bet ?? 0));
+    const base = currentBet > bb ? currentBet : bb;
+    const target = Math.round(base * Number(bbPreset.dataset.bbMult));
+    slider.value = String(Math.min(Number(slider.max), Math.max(Number(slider.min), target)));
+    slider.dispatchEvent(new Event("input"));
+    bbPreset.classList.add("selected");
     return;
   }
   const preset = e.target.closest("button[data-preset]");

@@ -1,4 +1,4 @@
-import { rankValue, suitOf } from "./cards.ts";
+import { freshDeck, rankValue, suitOf } from "./cards.ts";
 import type { Card } from "./types.ts";
 
 export const CATEGORY = {
@@ -167,4 +167,114 @@ export function evaluate7(cards: Card[], shortDeck = false): HandValue {
 
 export function rankName(value: HandValue): string {
   return CATEGORY_NAMES[value.category] ?? "未知";
+}
+
+function seedFromCards(hands: Record<string, Card[]>, board: Card[]): number {
+  let h = 2166136261;
+  const text = `${board.join("")}|${Object.keys(hands).sort().map((k) => `${k}:${hands[k]!.join("")}`).join("|")}`;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0 || 1;
+}
+
+function scoreBoard(
+  entries: [string, Card[]][],
+  board: Card[],
+  shortDeck: boolean,
+): string[] {
+  let best: HandValue | null = null;
+  let winners: string[] = [];
+  for (const [id, hole] of entries) {
+    const v = evaluateBest([...hole, ...board], shortDeck);
+    if (!best) {
+      best = v;
+      winners = [id];
+      continue;
+    }
+    const cmp = compareHand(v, best, shortDeck);
+    if (cmp > 0) {
+      best = v;
+      winners = [id];
+    } else if (cmp === 0) {
+      winners.push(id);
+    }
+  }
+  return winners;
+}
+
+/** Exact equities on flop/turn/river and deterministic 400-sample Monte Carlo preflop. */
+export function computeEquities(
+  hands: Record<string, Card[]>,
+  board: Card[],
+  shortDeck = false,
+): { equities: Record<string, number>; outs: Record<string, number> } {
+  const entries = Object.entries(hands).filter(([, h]) => h.length === 2);
+  const equities: Record<string, number> = {};
+  const outs: Record<string, number> = {};
+  for (const [id] of entries) {
+    equities[id] = 0;
+    outs[id] = 0;
+  }
+  if (entries.length === 0) return { equities, outs };
+  if (entries.length === 1) {
+    equities[entries[0]![0]] = 100;
+    return { equities, outs };
+  }
+
+  const used = new Set<Card>(board);
+  for (const [, hole] of entries) for (const c of hole) used.add(c);
+  const rem = freshDeck(shortDeck).filter((c) => !used.has(c));
+  const need = Math.max(0, 5 - board.length);
+  const shares: Record<string, number> = {};
+  for (const [id] of entries) shares[id] = 0;
+
+  let trials = 0;
+  if (need === 0) {
+    const winners = scoreBoard(entries, board, shortDeck);
+    for (const id of winners) shares[id]! += 1 / winners.length;
+    trials = 1;
+  } else if (need === 1) {
+    for (const r of rem) {
+      const winners = scoreBoard(entries, [...board, r], shortDeck);
+      for (const id of winners) {
+        shares[id]! += 1 / winners.length;
+        outs[id]! += 1;
+      }
+      trials += 1;
+    }
+  } else if (need === 2) {
+    for (let i = 0; i < rem.length; i++) {
+      for (let j = i + 1; j < rem.length; j++) {
+        const winners = scoreBoard(entries, [...board, rem[i]!, rem[j]!], shortDeck);
+        for (const id of winners) shares[id]! += 1 / winners.length;
+        trials += 1;
+      }
+    }
+  } else {
+    let seed = seedFromCards(hands, board);
+    const nextRand = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    const pool = rem.slice();
+    const samples = 400;
+    for (let t = 0; t < samples; t++) {
+      for (let i = 0; i < need; i++) {
+        const j = i + Math.floor(nextRand() * (pool.length - i));
+        const tmp = pool[i]!;
+        pool[i] = pool[j]!;
+        pool[j] = tmp;
+      }
+      const winners = scoreBoard(entries, [...board, ...pool.slice(0, need)], shortDeck);
+      for (const id of winners) shares[id]! += 1 / winners.length;
+      trials += 1;
+    }
+  }
+
+  for (const [id] of entries) {
+    equities[id] = trials > 0 ? Math.round((shares[id]! / trials) * 100) : 0;
+  }
+  return { equities, outs };
 }

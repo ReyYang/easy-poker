@@ -70,12 +70,22 @@ export function agentContext(snapshot) {
     folded: player.folded,
     allIn: player.allIn,
     me: player.playerId === snapshot.me.id,
+    ...(player.stats ? { stats: player.stats } : {}),
   } : null).filter(Boolean);
   const hero = players.find((player) => player.me);
   const activeOpponents = players.filter((player) => !player.me && !player.folded);
+  const handHistory = (snapshot.handActions ?? []).map((action) => ({
+    street: action.street,
+    playerId: action.playerId,
+    position: positions.get(action.playerId),
+    type: action.type,
+    label: action.label,
+    ...(action.amount === undefined ? {} : { amount: action.amount, amountBB: inBB(action.amount) }),
+    ...(action.allIn ? { allIn: true } : {}),
+  }));
   return {
     street: snapshot.street,
-    blinds: { small: snapshot.config.smallBlind, big: bigBlind },
+    blinds: { small: snapshot.config.smallBlind, big: bigBlind, ante: snapshot.config.ante ?? 0 },
     shortDeck: snapshot.config.shortDeck,
     holeCards: snapshot.me.holeCards,
     board: snapshot.board,
@@ -87,8 +97,27 @@ export function agentContext(snapshot) {
     activePlayerCount: players.filter((player) => !player.folded).length,
     players,
     streetActions: (snapshot.streetActions ?? []).map((action) => ({ ...action, amountBB: action.amount === undefined ? undefined : inBB(action.amount) })),
+    ...(handHistory.length ? { handHistory } : {}),
     legal: snapshot.legal,
   };
+}
+
+export function humanThinkDelayMs(snapshot, move, elapsedMs, random = Math.random) {
+  if (snapshot?.actionDeadline != null && snapshot?.now != null) {
+    const remaining = snapshot.actionDeadline - snapshot.now - elapsedMs;
+    if (remaining < 6000) return 0;
+  }
+  const type = move?.action;
+  const facingBet = (snapshot?.legal?.toCall ?? 0) > 0;
+  let target;
+  if (type === "raise" || type === "allin" || (snapshot?.street === "river" && facingBet)) {
+    target = 2300 + random() * 2000;
+  } else if (type === "call" || type === "bet") {
+    target = 1400 + random() * 1200;
+  } else {
+    target = 900 + random() * 800;
+  }
+  return Math.max(0, Math.round(target - Math.max(0, elapsedMs)));
 }
 
 export function legalMove(reply, legal) {
@@ -158,7 +187,7 @@ export async function decide(snapshot, level, config, signal) {
   const { apiKey, baseUrl, model } = config;
   if (!apiKey || !baseUrl || !model) throw new Error("需要 API Key、Base URL 和 Model");
   const input = JSON.stringify(agentContext(snapshot));
-  const instruction = `${PROMPTS[level] ?? PROMPTS.experienced}只依据提供的牌局事实决策，不假设对手风格或不可见信息。只输出 JSON，例如 {"action":"call"} 或 {"action":"raise","amount":10}。amount 是本轮总下注额，必须遵循 legal。`;
+  const instruction = `${PROMPTS[level] ?? PROMPTS.experienced}请结合整手牌的跨街行动历史（handHistory）与在座对手公开数据（stats，样本>=5手时参考 VPIP/PFR）保持连续的逻辑和牌风；只依据提供的牌局事实决策，不假设不可见底牌。只输出 JSON，例如 {"action":"call"} 或 {"action":"raise","amount":10}。amount 是本轮总下注额，必须遵循 legal。`;
   let result;
   try {
     let data;

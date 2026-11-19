@@ -1,4 +1,35 @@
-import { decide, gameWsUrl, legalMove, PRESET_BOTS, PROMPTS, PROMPT_LABELS } from "./agent-core.js";
+import { decide, gameWsUrl, humanThinkDelayMs, legalMove, PRESET_BOTS, PROMPTS, PROMPT_LABELS } from "./agent-core.js";
+
+const SHOW_BLUFF_RATE = { alan_keating: 0.4, tom_dwan: 0.28, tan_xuan: 0.25 };
+const WIN_EMOTES = {
+  alan_keating: ["🥳", "😜", "😂"],
+  tom_dwan: ["😏"],
+  tan_xuan: ["🥳", "😄"],
+  phil_ivey: ["😏"],
+  aaron_zang: ["😄"],
+};
+const LOSS_EMOTES = {
+  alan_keating: ["😂", "🙃"],
+  tan_xuan: ["😤"],
+  tom_dwan: ["🤔"],
+  aaron_zang: ["😅"],
+};
+
+function abortableSleep(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 const PROFILES_KEY = "easy-poker.ai.profiles.v1";
 const TABLES_KEY = "easy-poker.ai.tables.v1";
@@ -357,6 +388,10 @@ export class BrowserAiAgents {
       catch { /* server timeout will choose once */ }
       return;
     }
+    if (!snapshot.street && snapshot.lastResult && runtime.lastReactedHand !== snapshot.lastResult.handNumber) {
+      runtime.lastReactedHand = snapshot.lastResult.handNumber;
+      void this.maybeReactPostHand(runtime, snapshot);
+    }
     const turn = `${snapshot.handNumber}:${snapshot.street}:${snapshot.actionDeadline}`;
     if (!snapshot.legal || snapshot.actingPlayerId !== runtime.bot.playerId || runtime.busy || runtime.lastTurn === turn) return;
     runtime.busy = true;
@@ -383,6 +418,9 @@ export class BrowserAiAgents {
       runtime.abortController = null;
     }
     try {
+      if (!modelError) {
+        await abortableSleep(humanThinkDelayMs(runtime.snapshot ?? snapshot, move, Date.now() - startedAt), runtime.lifecycleController.signal);
+      }
       const current = runtime.snapshot;
       const currentTurn = `${current?.handNumber}:${current?.street}:${current?.actionDeadline}`;
       if (runtime.stopped || currentTurn !== turn || current?.actingPlayerId !== runtime.bot.playerId) return;
@@ -390,10 +428,48 @@ export class BrowserAiAgents {
       runtime.snapshot = data.snapshot;
       if (!modelError) this.setStatus(runtime, "运行中");
     } catch (err) {
+      if (runtime.stopped || err.name === "AbortError") return;
       runtime.lastTurn = "";
       this.setStatus(runtime, "连接异常", this.safeError(err, "行动提交失败"));
     } finally {
       runtime.busy = false;
+    }
+  }
+
+  async maybeReactPostHand(runtime, snapshot) {
+    const lr = snapshot.lastResult;
+    const id = runtime.bot.playerId;
+    const level = runtime.bot.level;
+    const bigBlind = Math.max(1, Number(snapshot.config?.bigBlind ?? 2));
+    const won = lr.winners?.some((w) => w.id === id && w.amount > 0);
+    const signal = runtime.lifecycleController.signal;
+    try {
+      if (won && lr.uncontested && snapshot.me?.holeCards?.length === 2 && !lr.shown?.[id]) {
+        const rate = SHOW_BLUFF_RATE[level] ?? 0;
+        if (rate > 0 && Math.random() < rate) {
+          await abortableSleep(700 + Math.random() * 500, signal);
+          if (runtime.stopped) return;
+          const cardIndex = Math.random() < 0.6 ? (Math.random() < 0.5 ? 0 : 1) : undefined;
+          await this.gameApi("/api/cmd", { type: "show", ...(cardIndex === undefined ? {} : { cardIndex }), tableNumber: this.tableNumber, playerId: id, nickname: runtime.bot.nickname }, signal);
+        }
+      }
+      if (won && lr.pot >= bigBlind * 15 && WIN_EMOTES[level] && Math.random() < 0.2) {
+        const pool = WIN_EMOTES[level];
+        const emoji = pool[Math.floor(Math.random() * pool.length)];
+        await abortableSleep(500 + Math.random() * 400, signal);
+        if (!runtime.stopped) {
+          await this.gameApi("/api/cmd", { type: "emote", emoji, tableNumber: this.tableNumber, playerId: id, nickname: runtime.bot.nickname }, signal);
+        }
+      } else if (!won && !lr.uncontested && lr.pot >= bigBlind * 30 && LOSS_EMOTES[level] && Math.random() < 0.15) {
+        const pool = LOSS_EMOTES[level];
+        const emoji = pool[Math.floor(Math.random() * pool.length)];
+        await abortableSleep(700 + Math.random() * 500, signal);
+        if (!runtime.stopped) {
+          await this.gameApi("/api/cmd", { type: "emote", emoji, tableNumber: this.tableNumber, playerId: id, nickname: runtime.bot.nickname }, signal);
+        }
+      }
+    } catch {
+      /* cooldown or next hand started */
     }
   }
 

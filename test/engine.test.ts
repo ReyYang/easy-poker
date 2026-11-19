@@ -5,6 +5,7 @@ import {
   RUNOUT_VOTE_MS,
   CATEGORY,
   compareHand,
+  computeEquities,
   createTable,
   EMOTE_COOLDOWN_MS,
   evaluate7,
@@ -894,5 +895,172 @@ describe("straddle / 鱿鱼 / 27杂色", () => {
     assert.equal(t.config.straddleAllowed, false);
     assert.equal(t.config.squidEnabled, false);
     assert.equal(t.config.bounty27Enabled, true);
+  });
+});
+
+describe("live cash-game features", () => {
+  it("supports preferred seat selection, seat_taken validation, changeSeat, and sitOut", () => {
+    const { table } = open({ tableNumber: "SEAT01" });
+    table.addPlayer("a", "A", table.password);
+    table.addPlayer("b", "B", table.password);
+    table.addPlayer("c", "C", table.password);
+    assert.equal(table.sit("a", 1, 3), 3);
+    assert.throws(() => table.sit("b", 1, 3), (e: unknown) => e instanceof PokerError && e.code === "seat_taken");
+    assert.throws(() => table.sit("b", 1, 8), (e: unknown) => e instanceof PokerError && e.code === "invalid_seat");
+    assert.equal(table.sit("b", 1, 5), 5);
+    assert.equal(table.sit("c", 1, 6), 6);
+
+    table.startHand();
+    const firstActor = actor(table);
+    assert.throws(() => table.changeSeat(firstActor, 2), (e: unknown) => e instanceof PokerError && e.code === "in_hand");
+    table.action(firstActor, { type: "fold" });
+    table.action(actor(table), { type: "fold" });
+    assert.equal(table.hand, null);
+
+    assert.equal(table.changeSeat("a", 2), 2);
+    assert.equal(table.seats[3], null);
+    assert.equal(table.seats[2], "a");
+
+    table.setSitOut("a", true);
+    table.startHand();
+    assert.equal(table.players.get("a")!.inHand, false);
+    assert.equal(table.players.get("a")!.holeCards, null);
+    assert.equal(table.players.get("b")!.inHand, true);
+    assert.equal(table.players.get("c")!.inHand, true);
+    table.action(actor(table), { type: "fold" });
+    table.setSitOut("a", false);
+    table.startHand();
+    assert.equal(table.players.get("a")!.inHand, true);
+  });
+
+  it("collects ante per dealt player and toggles per-player autoStraddle (default true)", () => {
+    const { table } = open({
+      tableNumber: "ANTE01",
+      smallBlind: 5,
+      bigBlind: 10,
+      ante: 2,
+      straddleAllowed: true,
+    });
+    joinSit(table, "a", "A");
+    joinSit(table, "b", "B");
+    joinSit(table, "c", "C");
+    assert.equal(table.players.get("a")!.autoStraddle, true);
+    assert.equal(table.players.get("b")!.autoStraddle, true);
+    assert.equal(table.players.get("c")!.autoStraddle, true);
+
+    table.setAutoStraddle("a", false);
+    table.setAutoStraddle("b", false);
+    table.setAutoStraddle("c", false);
+    table.startHand();
+    // 3 players post 2 ante each (6) + SB 5 + BB 10 = 21; no straddle posted.
+    assert.equal(table.hand!.straddleSeat, null);
+    assert.equal(table.snapshot("a").pot, 21);
+    const totalRemaining = ["a", "b", "c"].reduce((sum, id) => sum + table.players.get(id)!.chips, 0);
+    assert.equal(totalRemaining, 3 * 100 * 10 - 21);
+  });
+
+  it("auto-mucks losing hand at showdown and supports single-card and full voluntary showCards", () => {
+    const { table } = open({ tableNumber: "MUCK01" });
+    joinSit(table, "a", "A");
+    joinSit(table, "b", "B");
+    // Deal indices: a gets [0, 2] = As Ah; b gets [1, 3] = Kc Kd; board = 4d 5s 8h 9c 2d
+    const deck = parseCards("As Kc Ah Kd 4d 5s 8h 9c 2d");
+    table.startHand({ deck });
+    // Preflop: call, check; Flop: check, check; Turn: check, check
+    table.action(actor(table), { type: "call" });
+    table.action(actor(table), { type: "check" });
+    table.action(actor(table), { type: "check" });
+    table.action(actor(table), { type: "check" });
+    table.action(actor(table), { type: "check" });
+    table.action(actor(table), { type: "check" });
+    // River: b checks, a bets 2, b calls and loses
+    const firstRiver = actor(table);
+    table.action(firstRiver, { type: "check" });
+    const bettor = actor(table);
+    table.action(bettor, { type: "bet", amount: 2 });
+    table.action(firstRiver, { type: "call" });
+
+    assert.equal(table.hand, null);
+    assert.deepEqual(table.lastResult?.shown[bettor], ["As", "Ah"]);
+    assert.equal(table.lastResult?.shown[firstRiver], undefined);
+    assert.deepEqual(table.lastResult?.muckedIds, [firstRiver]);
+
+    table.showCards(firstRiver, 0);
+    assert.deepEqual(table.lastResult?.shown[firstRiver], ["Kc", null]);
+    assert.deepEqual(table.lastResult?.muckedIds, []);
+
+    table.showCards(firstRiver, 1);
+    assert.deepEqual(table.lastResult?.shown[firstRiver], ["Kc", "Kd"]);
+  });
+
+  it("computes equities and emits 4 all-in runout stages", () => {
+    const eq = computeEquities(
+      { a: parseCards("As Ah"), b: parseCards("Ks Kd") },
+      parseCards("2c 7d 9h"),
+    );
+    assert.ok(eq.equities.a > 85);
+    assert.ok(eq.equities.b < 15);
+    assert.equal(Math.round(eq.equities.a + eq.equities.b), 100);
+
+    const { table } = open({ tableNumber: "RUN001", maxBuyins: 10 });
+    joinSit(table, "a", "A");
+    joinSit(table, "b", "B");
+    table.startHand({ deck: parseCards("As Kc Ah Kd 2c 7d 9h Jc 3s") });
+    allInEveryone(table);
+    table.chooseRunout("a", "once");
+    assert.equal(table.lastResult?.allInRunout, true);
+    const stages = table.lastResult?.runs?.[0]?.stages;
+    assert.equal(stages?.length, 4);
+    assert.deepEqual(stages?.map((s) => s.street), ["preflop", "flop", "turn", "river"]);
+    assert.equal(stages?.[0]?.board.length, 0);
+    assert.equal(stages?.[1]?.board.length, 3);
+    assert.equal(stages?.[2]?.board.length, 4);
+    assert.equal(stages?.[3]?.board.length, 5);
+    assert.equal(stages?.[3]?.equities.a, 100);
+    assert.equal(stages?.[3]?.equities.b, 0);
+
+    const { table: threeWay } = open({ tableNumber: "RUN301", maxBuyins: 10 });
+    joinSit(threeWay, "a", "A");
+    joinSit(threeWay, "b", "B");
+    joinSit(threeWay, "c", "C");
+    threeWay.startHand();
+    allInEveryone(threeWay);
+    assert.equal(threeWay.lastResult?.allInRunout, true);
+    const threeStages = threeWay.lastResult?.runs?.[0]?.stages;
+    assert.equal(threeStages?.length, 4);
+    assert.deepEqual(threeStages?.map((s) => s.street), ["preflop", "flop", "turn", "river"]);
+  });
+
+  it("tracks multi-street handActions, player VPIP/PFR/3-Bet stats, and caps hand history at 20", () => {
+    const { table } = open({ tableNumber: "STAT01" });
+    joinSit(table, "a", "A");
+    joinSit(table, "b", "B");
+    table.startHand({ deck: parseCards("As Kc Ah Kd 2c 7d 9h Jc 3s") });
+    const p1 = actor(table);
+    table.action(p1, { type: "raise", amount: 6 }); // PFR + VPIP
+    const p2 = actor(table);
+    table.action(p2, { type: "raise", amount: 18 }); // 3-Bet + PFR + VPIP
+    table.action(p1, { type: "call" });
+    // Now on flop
+    assert.equal(table.snapshot(p1).handActions.length, 3);
+    table.action(actor(table), { type: "check" });
+    assert.equal(table.snapshot(p1).handActions.length, 4);
+    table.action(actor(table), { type: "bet", amount: 10 });
+    table.action(actor(table), { type: "fold" });
+
+    const snap = table.snapshot("a");
+    assert.equal(snap.history.length, 1);
+    assert.equal(snap.history[0]!.actions.length, 6);
+    assert.equal(snap.standings.find((s) => s.id === p1)?.stats?.vpip, 100);
+    assert.equal(snap.standings.find((s) => s.id === p1)?.stats?.pfr, 100);
+    assert.equal(snap.standings.find((s) => s.id === p2)?.stats?.threeBet, 100);
+
+    for (let i = 0; i < 21; i++) {
+      table.startHand();
+      table.action(actor(table), { type: "fold" });
+    }
+    assert.equal(table.history.length, 20);
+    assert.equal(table.history[0]!.handNumber, 3);
+    assert.equal(table.history[19]!.handNumber, 22);
   });
 });

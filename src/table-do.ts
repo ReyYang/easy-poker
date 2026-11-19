@@ -108,6 +108,9 @@ export class TableDO {
         straddleAllowed: body.straddleAllowed,
         squidEnabled: body.squidEnabled,
         bounty27Enabled: body.bounty27Enabled,
+        smallBlind: body.smallBlind,
+        bigBlind: body.bigBlind,
+        ante: body.ante,
         tableNumber: body.tableNumber,
         password: body.password,
       },
@@ -136,7 +139,17 @@ export class TableDO {
           table.addPlayer(playerId, nickname, String(body.password ?? ""));
           break;
         case "sit":
-          table.sit(playerId, Number(body.buyinCount ?? 0));
+          table.sit(
+            playerId,
+            Number(body.buyinCount ?? 0),
+            body.seat === undefined || body.seat === null ? undefined : Number(body.seat),
+          );
+          break;
+        case "changeSeat":
+          table.changeSeat(playerId, Number(body.seat));
+          break;
+        case "sitOut":
+          table.setSitOut(playerId, Boolean(body.sitOut));
           break;
         case "stand":
           table.stand(playerId);
@@ -154,7 +167,10 @@ export class TableDO {
           });
           break;
         case "show":
-          table.showCards(playerId);
+          table.showCards(playerId, body.cardIndex === 0 || body.cardIndex === 1 ? body.cardIndex : undefined);
+          break;
+        case "endTable":
+          table.forceEnd();
           break;
         case "emote":
           table.emote(playerId, String(body.emoji ?? ""));

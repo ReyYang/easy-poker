@@ -1,7 +1,7 @@
 import { cryptoRandom, freshDeck, isSevenDeuceOffsuit, shuffle } from "./cards.ts";
 import { generatePassword, generateTableNumber, normalizeConfig } from "./config.ts";
 import { buildSidePots, splitOddChips } from "./pots.ts";
-import { compareHand, evaluateBest, rankName, type HandValue } from "./rank.ts";
+import { compareHand, computeEquities, evaluateBest, rankName, type HandValue } from "./rank.ts";
 import {
   ACTION_MS,
   HAND_PAUSE_MS,
@@ -14,8 +14,13 @@ import {
   type GameEvent,
   type HandAction,
   type HandState,
+  type HandSummary,
   type LegalActions,
+  type PlayerHud,
   type PlayerState,
+  type PlayerStats,
+  type RecordedAction,
+  type RunStage,
   type RuntimeOpts,
   type RunoutVote,
   type Settlement,
@@ -50,18 +55,21 @@ export interface TableJSON {
   nextHandAt: number | null;
   runoutVote: RunoutVote | null;
   reactions?: Record<string, { emoji: string; until: number }>;
+  history?: HandSummary[];
 }
 
 export interface LastResult {
   handNumber: number;
   board: Card[];
-  shown: Record<string, Card[]>;
+  shown: Record<string, (Card | null)[]>;
+  muckedIds?: string[];
+  allInRunout?: boolean;
   winners: { id: string; amount: number; handName?: string }[];
   pot: number;
   uncontested: boolean;
   foldedIds: string[];
   timeoutIds: string[];
-  runs: { board: Card[]; winners: { id: string; amount: number; handName?: string }[] }[];
+  runs: { board: Card[]; winners: { id: string; amount: number; handName?: string }[]; stages?: RunStage[] }[];
 }
 
 export interface SeatView {
@@ -72,7 +80,8 @@ export interface SeatView {
   folded: boolean;
   allIn: boolean;
   sitting: boolean;
-  holeCards?: Card[];
+  sittingOut?: boolean;
+  holeCards?: (Card | null)[];
   isButton: boolean;
   isSb: boolean;
   isBb: boolean;
@@ -81,6 +90,8 @@ export interface SeatView {
   acting: boolean;
   inHand: boolean;
   pendingChips: number;
+  lastAction?: { type: ActionType; amount?: number; label: string };
+  stats?: PlayerHud;
   reaction?: { emoji: string; until: number };
 }
 
@@ -96,6 +107,7 @@ export interface ClientSnapshot {
   spectators: { id: string; nickname: string }[];
   board: Card[];
   pot: number;
+  sidePots: { amount: number; eligibleCount: number }[];
   street: Street | null;
   actingPlayerId: string | null;
   actionDeadline: number | null;
@@ -107,7 +119,10 @@ export interface ClientSnapshot {
     chips: number;
     buyinCount: number;
     holeCards?: Card[];
+    heroHandName?: string;
     sitting: boolean;
+    sittingOut: boolean;
+    autoStraddle: boolean;
     pendingChips: number;
   } | null;
   handNumber: number;
@@ -120,7 +135,9 @@ export interface ClientSnapshot {
   settlement: Settlement | null;
   events: GameEvent[];
   streetActions: HandAction[];
+  handActions: RecordedAction[];
   lastResult: LastResult | null;
+  history: HandSummary[];
   nextHandAt: number | null;
   invitePath: string;
   runoutVote: RunoutVote | null;
@@ -142,12 +159,29 @@ function defaultRandom(): number {
   return cryptoRandom();
 }
 
+function emptyStats(): PlayerStats {
+  return { handsDealt: 0, vpipHands: 0, pfrHands: 0, threeBetHands: 0, showdowns: 0, showdownWins: 0 };
+}
+
+function toHud(s?: PlayerStats): PlayerHud {
+  const st = s ?? emptyStats();
+  const pct = (num: number, den: number) => (den > 0 ? Math.round((num / den) * 100) : 0);
+  return {
+    handsDealt: st.handsDealt,
+    vpip: pct(st.vpipHands, st.handsDealt),
+    pfr: pct(st.pfrHands, st.handsDealt),
+    threeBet: pct(st.threeBetHands, st.handsDealt),
+    wsd: pct(st.showdownWins, st.showdowns),
+  };
+}
+
 function emptyPlayer(id: string, nickname: string): PlayerState {
   return {
     id,
     nickname,
     seat: null,
     sitting: false,
+    sittingOut: false,
     chips: 0,
     buyinCount: 0,
     buyinChips: 0,
@@ -159,10 +193,11 @@ function emptyPlayer(id: string, nickname: string): PlayerState {
     committed: 0,
     actedThisStreet: false,
     shown: false,
-    autoStraddle: false,
+    autoStraddle: true,
     pendingBuyinChips: 0,
     timeoutStreak: 0,
     lastEmoteAt: null,
+    stats: emptyStats(),
   };
 }
 
@@ -187,6 +222,7 @@ export class Table {
   bountyPaid = new Set<string>();
   runoutVote: RunoutVote | null = null;
   reactions: Record<string, { emoji: string; until: number }> = {};
+  history: HandSummary[] = [];
   lastTimeoutIds: string[] = [];
   now: () => number;
   random: () => number;
@@ -201,7 +237,7 @@ export class Table {
 
   static fromJSON(data: TableJSON, runtime?: RuntimeOpts): Table {
     const t = new Table(
-      { tableNumber: data.tableNumber, password: data.password, config: data.config },
+      { tableNumber: data.tableNumber, password: data.password, config: { ...data.config, ante: data.config.ante ?? 0 } },
       runtime,
     );
     t.status = data.status;
@@ -211,10 +247,13 @@ export class Table {
         p.id,
         {
           ...p,
+          sittingOut: p.sittingOut ?? false,
+          autoStraddle: p.autoStraddle ?? true,
           holeCards: p.holeCards ? p.holeCards.slice() : null,
           pendingBuyinChips: p.pendingBuyinChips ?? 0,
           timeoutStreak: p.timeoutStreak ?? 0,
           lastEmoteAt: p.lastEmoteAt ?? null,
+          stats: p.stats ? { ...emptyStats(), ...p.stats } : emptyStats(),
         },
       ]),
     );
@@ -228,6 +267,12 @@ export class Table {
           board: data.hand.board.slice(),
           pots: data.hand.pots.map((p) => ({ ...p, eligible: p.eligible.slice() })),
           streetActions: data.hand.streetActions?.map((action) => ({ ...action })) ?? [],
+          handActions: data.hand.handActions?.map((action) => ({ ...action })) ?? [],
+          lastAggressorId: data.hand.lastAggressorId ?? null,
+          raiseCount: data.hand.raiseCount ?? 0,
+          vpipIds: data.hand.vpipIds?.slice() ?? [],
+          pfrIds: data.hand.pfrIds?.slice() ?? [],
+          threeBetIds: data.hand.threeBetIds?.slice() ?? [],
         }
       : null;
     t.squid = data.squid
@@ -241,11 +286,22 @@ export class Table {
           board: data.lastResult.board.slice(),
           winners: data.lastResult.winners.slice(),
           shown: { ...data.lastResult.shown },
+          muckedIds: data.lastResult.muckedIds?.slice() ?? [],
+          allInRunout: data.lastResult.allInRunout ?? false,
           uncontested: data.lastResult.uncontested ?? Object.keys(data.lastResult.shown ?? {}).length === 0,
           foldedIds: data.lastResult.foldedIds?.slice() ?? [],
           timeoutIds: data.lastResult.timeoutIds?.slice() ?? [],
           runs: (data.lastResult.runs ?? [{ board: data.lastResult.board, winners: data.lastResult.winners }]).map(
-            (r) => ({ board: r.board.slice(), winners: r.winners.slice() }),
+            (r) => ({
+              board: r.board.slice(),
+              winners: r.winners.slice(),
+              stages: r.stages?.map((s) => ({
+                street: s.street,
+                board: s.board.slice(),
+                equities: { ...s.equities },
+                outs: s.outs ? { ...s.outs } : undefined,
+              })),
+            }),
           ),
         }
       : null;
@@ -257,6 +313,7 @@ export class Table {
       ? { deadline: data.runoutVote.deadline, choices: { ...data.runoutVote.choices } }
       : null;
     t.reactions = data.reactions ?? {};
+    t.history = (data.history ?? []).slice(-20);
     t.lastTimeoutIds = [];
     return t;
   }
@@ -271,6 +328,7 @@ export class Table {
       players: [...this.players.values()].map((p) => ({
         ...p,
         holeCards: p.holeCards ? p.holeCards.slice() : null,
+        stats: { ...p.stats },
       })),
       buttonSeat: this.buttonSeat,
       firstDealAt: this.firstDealAt,
@@ -282,6 +340,10 @@ export class Table {
             board: this.hand.board.slice(),
             pots: this.hand.pots.map((p) => ({ ...p, eligible: p.eligible.slice() })),
             streetActions: this.hand.streetActions.map((action) => ({ ...action })),
+            handActions: this.hand.handActions.map((action) => ({ ...action })),
+            vpipIds: this.hand.vpipIds.slice(),
+            pfrIds: this.hand.pfrIds.slice(),
+            threeBetIds: this.hand.threeBetIds.slice(),
           }
         : null,
       squid: this.squid
@@ -296,6 +358,7 @@ export class Table {
       bountyPaid: [...this.bountyPaid],
       runoutVote: this.runoutVote ? { deadline: this.runoutVote.deadline, choices: { ...this.runoutVote.choices } } : null,
       reactions: this.reactions,
+      history: this.history.slice(-20),
     };
   }
 
@@ -331,12 +394,22 @@ export class Table {
     return p;
   }
 
-  sit(playerId: string, buyinCount = 0): number {
+  sit(playerId: string, buyinCount = 0, preferredSeat?: number): number {
     this.assertNotFinished();
     const p = this.requirePlayer(playerId);
     if (p.sitting) throw new PokerError("already_seated", "已经坐下");
     const empty = this.emptySeats();
     if (empty.length === 0) throw new PokerError("table_full", "游戏桌已满 8 人");
+    let seat: number;
+    if (preferredSeat !== undefined && preferredSeat !== null) {
+      if (!Number.isInteger(preferredSeat) || preferredSeat < 0 || preferredSeat >= MAX_SEATS) {
+        throw new PokerError("invalid_seat", "无效座位");
+      }
+      if (this.seats[preferredSeat]) throw new PokerError("seat_taken", "该座位已有人");
+      seat = preferredSeat;
+    } else {
+      seat = empty[Math.floor(this.random() * empty.length)]!;
+    }
     const n = Math.floor(buyinCount);
     if (p.chips <= 0) {
       if (!Number.isInteger(n) || n < 1) throw new PokerError("invalid_buyin", "坐下时需要至少 1 次 buyin");
@@ -344,14 +417,39 @@ export class Table {
     } else if (n > 0) {
       this.applyBuyin(p, n, "now");
     }
-    const seat = empty[Math.floor(this.random() * empty.length)]!;
     p.seat = seat;
     p.sitting = true;
+    p.sittingOut = false;
     p.timeoutStreak = 0;
     this.seats[seat] = p.id;
     this.maybeJoinSquid(p.id);
     this.maybeScheduleNextHand();
     return seat;
+  }
+
+  changeSeat(playerId: string, targetSeat: number): number {
+    this.assertNotFinished();
+    const p = this.requirePlayer(playerId);
+    if (!p.sitting || p.seat === null) throw new PokerError("not_seated", "未坐下");
+    if (p.inHand && this.hand && !p.folded) throw new PokerError("in_hand", "弃牌或本手结束后才能换座");
+    if (!Number.isInteger(targetSeat) || targetSeat < 0 || targetSeat >= MAX_SEATS) {
+      throw new PokerError("invalid_seat", "无效座位");
+    }
+    if (targetSeat === p.seat) return targetSeat;
+    if (this.seats[targetSeat]) throw new PokerError("seat_taken", "该座位已有人");
+    this.seats[p.seat] = null;
+    p.seat = targetSeat;
+    this.seats[targetSeat] = p.id;
+    return targetSeat;
+  }
+
+  setSitOut(playerId: string, sitOut: boolean): void {
+    this.assertNotFinished();
+    const p = this.requirePlayer(playerId);
+    if (!p.sitting) throw new PokerError("not_seated", "未坐下");
+    p.sittingOut = Boolean(sitOut);
+    if (!p.sittingOut) this.maybeScheduleNextHand();
+    else if (!this.canStartHand()) this.nextHandAt = null;
   }
 
   stand(playerId: string): void {
@@ -373,6 +471,7 @@ export class Table {
     }
     this.seats[p.seat] = null;
     p.sitting = false;
+    p.sittingOut = false;
     p.seat = null;
     p.timeoutStreak = 0;
     p.inHand = false;
@@ -407,12 +506,28 @@ export class Table {
     this.events = [{ type: "emote", playerId, emoji, variant: 1 + Math.floor(this.random() * 3), at: now }];
   }
 
-  showCards(playerId: string): void {
+  showCards(playerId: string, cardIndex?: 0 | 1): void {
     const p = this.requirePlayer(playerId);
     if (this.hand || !this.lastResult) throw new PokerError("hand_in_progress", "本手结束后才能亮牌");
     if (!p.holeCards) throw new PokerError("no_cards", "没有手牌可展示");
     p.shown = true;
-    if (this.lastResult) this.lastResult.shown[p.id] = p.holeCards.slice();
+    if (cardIndex === 0 || cardIndex === 1) {
+      const prev = this.lastResult.shown[p.id] ?? [null, null];
+      this.lastResult.shown[p.id] = [
+        cardIndex === 0 ? p.holeCards[0]! : (prev[0] ?? null),
+        cardIndex === 1 ? p.holeCards[1]! : (prev[1] ?? null),
+      ];
+    } else {
+      this.lastResult.shown[p.id] = p.holeCards.slice();
+    }
+    if (this.lastResult.muckedIds) {
+      this.lastResult.muckedIds = this.lastResult.muckedIds.filter((id) => id !== p.id);
+    }
+    const lastSummary = this.history[this.history.length - 1];
+    if (lastSummary && lastSummary.handNumber === this.lastResult.handNumber) {
+      lastSummary.shown[p.id] = this.lastResult.shown[p.id]!.slice();
+      lastSummary.muckedIds = lastSummary.muckedIds.filter((id) => id !== p.id);
+    }
   }
 
   startHand(opts: StartHandOpts = {}): void {
@@ -423,7 +538,7 @@ export class Table {
       throw new PokerError("table_finished", "游戏桌已结束");
     }
     this.applyPendingBuyins();
-    const eligible = this.seated().filter((p) => p.chips > 0);
+    const eligible = this.seated().filter((p) => !p.sittingOut && p.chips > 0);
     if (eligible.length < 2) throw new PokerError("need_two_players", "至少两名有筹码的玩家才能发牌");
 
     this.events = [];
@@ -433,7 +548,7 @@ export class Table {
     this.nextHandAt = null;
     this.bountyPaid = new Set();
     this.advanceButton(eligible);
-    const participants = this.seated().filter((p) => p.chips > 0);
+    const participants = this.seated().filter((p) => !p.sittingOut && p.chips > 0);
     for (const p of this.players.values()) {
       p.holeCards = null;
       p.folded = false;
@@ -451,6 +566,7 @@ export class Table {
 
     for (const p of participants) {
       p.inHand = true;
+      p.stats.handsDealt += 1;
     }
 
     const deck = opts.deck ? opts.deck.slice() : shuffle(freshDeck(this.config.shortDeck), this.random);
@@ -478,12 +594,27 @@ export class Table {
       pots: [],
       streetPot: 0,
       streetActions: [],
+      handActions: [],
+      lastAggressorId: null,
+      raiseCount: 1,
+      vpipIds: [],
+      pfrIds: [],
+      threeBetIds: [],
     };
 
     if (this.firstDealAt === null) {
       this.firstDealAt = this.now();
       this.endsAt = this.firstDealAt + this.config.durationMinutes * 60 * 1000;
       this.status = "playing";
+    }
+
+    if ((this.config.ante ?? 0) > 0) {
+      for (const p of participants) {
+        const antePay = Math.min(p.chips, this.config.ante);
+        p.chips -= antePay;
+        p.committed += antePay;
+        if (p.chips === 0) p.allIn = true;
+      }
     }
 
     this.postBlind(sbSeat, this.config.smallBlind);
@@ -497,6 +628,7 @@ export class Table {
       this.config.straddleAllowed &&
       participants.length >= 3 &&
       utgSeat !== null &&
+      this.playerAt(utgSeat)?.autoStraddle !== false &&
       opts.straddle !== false;
     if (wantStraddle && utgSeat !== null) {
       const utg = this.playerAt(utgSeat)!;
@@ -525,7 +657,7 @@ export class Table {
   }
 
   private seatedWithChips(): PlayerState[] {
-    return this.seated().filter((p) => p.chips + (p.pendingBuyinChips ?? 0) > 0);
+    return this.seated().filter((p) => !p.sittingOut && p.chips + (p.pendingBuyinChips ?? 0) > 0);
   }
 
   /** Next Durable Object alarm: action clock, showdown pause, 时长 end, or the inter-hand pause. */
@@ -610,6 +742,9 @@ export class Table {
       const p = this.players.get(pid);
       if (!p) return null;
       const showHoles = this.shouldShowHoles(p, viewerId);
+      const streetLast = hand
+        ? [...hand.handActions].reverse().find((a) => a.street === hand.street && a.playerId === p.id)
+        : undefined;
       return {
         playerId: p.id,
         nickname: p.nickname,
@@ -618,7 +753,8 @@ export class Table {
         folded: p.folded,
         allIn: p.allIn,
         sitting: p.sitting,
-        holeCards: showHoles && p.holeCards ? p.holeCards.slice() : undefined,
+        sittingOut: p.sittingOut || undefined,
+        holeCards: showHoles ? (this.visibleHoleCards(p, viewerId) ?? undefined) : undefined,
         isButton: (hand?.buttonSeat ?? this.buttonSeat) === seat,
         isSb: hand?.sbSeat === seat,
         isBb: hand?.bbSeat === seat,
@@ -627,6 +763,10 @@ export class Table {
         acting: hand?.actingPlayerId === p.id,
         inHand: p.inHand,
         pendingChips: p.pendingBuyinChips ?? 0,
+        lastAction: streetLast
+          ? { type: streetLast.type, amount: streetLast.amount, label: streetLast.label }
+          : undefined,
+        stats: toHud(p.stats),
         reaction: this.reactions[p.id]?.until > this.now() ? this.reactions[p.id] : undefined,
       };
     });
@@ -635,7 +775,14 @@ export class Table {
       .map((p) => ({ id: p.id, nickname: p.nickname }));
     let holeCards: Card[] | undefined;
     if (viewer?.sitting && viewer.holeCards) holeCards = viewer.holeCards.slice();
-    else if (viewer?.sitting && this.lastResult?.shown[viewer.id]) holeCards = this.lastResult.shown[viewer.id]!.slice();
+    else if (viewer?.sitting && this.lastResult?.shown[viewer.id]) {
+      const shown = this.lastResult.shown[viewer.id]!.filter((c): c is Card => c !== null);
+      if (shown.length > 0) holeCards = shown;
+    }
+    const heroHandName =
+      viewer?.sitting && viewer.holeCards?.length === 2 && board.length >= 3
+        ? rankName(evaluateBest([...viewer.holeCards, ...board], this.config.shortDeck))
+        : undefined;
 
     return {
       tableNumber: this.tableNumber,
@@ -649,6 +796,7 @@ export class Table {
       spectators,
       board,
       pot,
+      sidePots: this.currentSidePots(),
       street: hand?.street ?? null,
       actingPlayerId: hand?.actingPlayerId ?? null,
       actionDeadline: hand?.actionDeadline ?? null,
@@ -661,7 +809,10 @@ export class Table {
             chips: viewer.chips,
             buyinCount: viewer.buyinCount,
             holeCards,
+            heroHandName,
             sitting: viewer.sitting,
+            sittingOut: viewer.sittingOut,
+            autoStraddle: viewer.autoStraddle,
             pendingChips: viewer.pendingBuyinChips ?? 0,
           }
         : null,
@@ -675,22 +826,32 @@ export class Table {
       settlement: this.settlement,
       events: this.events.slice(),
       streetActions: hand?.streetActions.map((action) => ({ ...action })) ?? [],
+      handActions: hand?.handActions.map((action) => ({ ...action })) ?? [],
       lastResult: this.lastResult
         ? {
             handNumber: this.lastResult.handNumber,
             board: this.lastResult.board.slice(),
             winners: this.lastResult.winners.slice(),
             pot: this.lastResult.pot,
-            shown: { ...this.lastResult.shown },
+            shown: Object.fromEntries(Object.entries(this.lastResult.shown).map(([id, cards]) => [id, cards.slice()])),
+            muckedIds: this.lastResult.muckedIds?.slice() ?? [],
+            allInRunout: this.lastResult.allInRunout ?? false,
             uncontested: this.lastResult.uncontested,
             foldedIds: this.lastResult.foldedIds.slice(),
             timeoutIds: this.lastResult.timeoutIds.slice(),
             runs: this.lastResult.runs.map((r) => ({
               board: r.board.slice(),
               winners: r.winners.slice(),
+              stages: r.stages?.map((s) => ({
+                street: s.street,
+                board: s.board.slice(),
+                equities: { ...s.equities },
+                outs: s.outs ? { ...s.outs } : undefined,
+              })),
             })),
           }
         : null,
+      history: this.history.slice(-20),
       nextHandAt: this.nextHandAt,
       invitePath: this.getInvite().path,
       runoutVote: this.runoutVote
@@ -729,6 +890,22 @@ export class Table {
     if (p.id === viewerId && p.holeCards) return true;
     if (!this.hand && this.lastResult?.shown[p.id]) return true;
     return false;
+  }
+
+  private visibleHoleCards(p: PlayerState, viewerId: string | null): (Card | null)[] | null {
+    if (p.id === viewerId && p.holeCards) return p.holeCards.slice();
+    if (!this.hand && this.lastResult?.shown[p.id]) return this.lastResult.shown[p.id]!.slice();
+    return null;
+  }
+
+  private currentSidePots(): { amount: number; eligibleCount: number }[] {
+    if (!this.hand) return [];
+    const committed = new Map<string, number>();
+    for (const p of this.players.values()) if (p.committed > 0) committed.set(p.id, p.committed);
+    if (committed.size === 0) return [];
+    const folded = new Set([...this.players.values()].filter((p) => p.folded || !p.inHand).map((p) => p.id));
+    const { pots } = buildSidePots(committed, folded);
+    return pots.map((pot) => ({ amount: pot.amount, eligibleCount: pot.eligible.length }));
   }
 
   private displayedPot(): number {
@@ -973,10 +1150,38 @@ export class Table {
   }
 
   private recordAction(playerId: string, type: ActionType, amount?: number): void {
+    const p = this.players.get(playerId);
     const action: HandAction = amount === undefined ? { playerId, type } : { playerId, type, amount };
-    if (this.players.get(playerId)?.allIn) action.allIn = true;
-    this.hand?.streetActions.push(action);
+    if (p?.allIn) action.allIn = true;
+    const hand = this.hand;
+    hand?.streetActions.push(action);
     this.events.push(action);
+    if (!hand) return;
+    let label =
+      type === "fold"
+        ? "弃牌"
+        : type === "check"
+          ? "过牌"
+          : type === "call"
+            ? "跟注"
+            : type === "bet"
+              ? "下注"
+              : type === "allin"
+                ? "All-in"
+                : hand.raiseCount >= 3
+                  ? `${hand.raiseCount}-Bet`
+                  : "加注";
+    if (action.allIn && type !== "allin") label = "All-in";
+    hand.handActions.push({ ...action, street: hand.street, nickname: p?.nickname ?? "", label });
+    if (hand.street === "preflop") {
+      if ((type === "call" || type === "bet" || type === "raise" || type === "allin") && !hand.vpipIds.includes(playerId)) {
+        hand.vpipIds.push(playerId);
+      }
+      if ((type === "raise" || (type === "allin" && hand.lastAggressorId === playerId)) && !hand.pfrIds.includes(playerId)) {
+        hand.pfrIds.push(playerId);
+        if (hand.raiseCount >= 3 && !hand.threeBetIds.includes(playerId)) hand.threeBetIds.push(playerId);
+      }
+    }
   }
 
   private raiseTo(p: PlayerState, to: number): void {
@@ -1017,6 +1222,8 @@ export class Table {
         throw new PokerError("illegal_action", "加注不足");
       }
       hand.currentBet = newBet;
+      hand.lastAggressorId = p.id;
+      hand.raiseCount += 1;
     }
   }
 
@@ -1066,6 +1273,8 @@ export class Table {
     hand.minRaise = this.config.bigBlind;
     hand.lastFullRaise = this.config.bigBlind;
     hand.streetActions = [];
+    hand.lastAggressorId = null;
+    hand.raiseCount = 0;
   }
 
   private dealBoard(n: number): void {
@@ -1119,55 +1328,77 @@ export class Table {
       return;
     }
     const moreBetting = live.filter((p) => p.chips > 0 && !p.allIn).length >= 2;
+    if (!moreBetting && hand.street !== "river") {
+      this.resetStreetBets();
+      this.runoutAndShowdown(1);
+      return;
+    }
     if (hand.street === "preflop") {
       hand.street = "flop";
       this.dealBoard(3);
       this.resetStreetBets();
-      if (moreBetting) this.beginBetting();
-      else this.runoutAndShowdown(1);
+      this.beginBetting();
       return;
     }
     if (hand.street === "flop") {
       hand.street = "turn";
       this.dealBoard(1);
       this.resetStreetBets();
-      if (moreBetting) this.beginBetting();
-      else this.runoutAndShowdown(1);
+      this.beginBetting();
       return;
     }
     if (hand.street === "turn") {
       hand.street = "river";
       this.dealBoard(1);
       this.resetStreetBets();
-      if (moreBetting) this.beginBetting();
-      else this.showdownRuns(1);
+      this.beginBetting();
       return;
     }
-    this.showdownRuns(1);
+    this.showdownRuns(1, undefined, false);
   }
 
   private runoutAndShowdown(times: number): void {
     const hand = this.hand!;
     const shared = hand.board.slice();
     const runs: Card[][] = [];
+    const runStages: RunStage[][] = [];
+    const liveHands = Object.fromEntries(
+      this.livePlayers()
+        .filter((p) => p.holeCards?.length === 2)
+        .map((p) => [p.id, p.holeCards!]),
+    );
     const n = times < 2 ? 1 : 2;
+    const makeStage = (street: Street, board: Card[]): RunStage => ({
+      street,
+      board: board.slice(),
+      ...computeEquities(liveHands, board, this.config.shortDeck),
+    });
     for (let i = 0; i < n; i++) {
       hand.board = shared.slice();
+      const stages: RunStage[] = [];
+      if (hand.board.length < 5 && Object.keys(liveHands).length >= 2) {
+        const startStreet: Street = hand.board.length === 0 ? "preflop" : hand.board.length === 3 ? "flop" : "turn";
+        stages.push(makeStage(startStreet, hand.board));
+      }
       while (hand.board.length < 5) {
         if (hand.board.length === 0) {
           hand.street = "flop";
           this.dealBoard(3);
+          if (Object.keys(liveHands).length >= 2) stages.push(makeStage("flop", hand.board));
         } else if (hand.board.length === 3) {
           hand.street = "turn";
           this.dealBoard(1);
+          if (Object.keys(liveHands).length >= 2) stages.push(makeStage("turn", hand.board));
         } else {
           hand.street = "river";
           this.dealBoard(1);
+          if (Object.keys(liveHands).length >= 2) stages.push(makeStage("river", hand.board));
         }
       }
       runs.push(hand.board.slice());
+      runStages.push(stages);
     }
-    this.showdownRuns(n, runs);
+    this.showdownRuns(n, runs, true, runStages);
   }
 
   private awardUncontested(): void {
@@ -1197,10 +1428,14 @@ export class Table {
     this.finishHand(awards, potTotal, false);
   }
 
-  private showdownRuns(times: number, boards?: Card[][]): void {
+  private showdownRuns(
+    times: number,
+    boards?: Card[][],
+    forceShowAll = true,
+    runStages?: RunStage[][],
+  ): void {
     const hand = this.hand!;
     const live = this.livePlayers();
-    for (const p of live) p.shown = true;
     const committed = new Map<string, number>();
     for (const p of this.players.values()) {
       if (p.committed > 0) committed.set(p.id, p.committed);
@@ -1252,7 +1487,32 @@ export class Table {
           amount,
           handName: values.get(id) ? rankName(values.get(id)!) : undefined,
         })),
+        stages: runStages?.[ri],
       });
+    }
+
+    const muckedIds: string[] = [];
+    if (forceShowAll || runBoards.length > 1) {
+      for (const p of live) p.shown = true;
+    } else {
+      const liveIds = order.filter((id) => live.some((p) => p.id === id));
+      const aggIdx = hand.lastAggressorId ? liveIds.indexOf(hand.lastAggressorId) : -1;
+      const startIdx = aggIdx >= 0 ? aggIdx : 0;
+      const showOrder = liveIds.length ? [...liveIds.slice(startIdx), ...liveIds.slice(0, startIdx)] : [];
+      showOrder.forEach((id, idx) => {
+        const p = this.players.get(id);
+        if (!p) return;
+        if (idx === 0 || p.allIn || (combined.get(id) ?? 0) > 0) {
+          p.shown = true;
+        } else {
+          p.shown = false;
+          muckedIds.push(id);
+        }
+      });
+    }
+    for (const p of live) {
+      p.stats.showdowns += 1;
+      if ((combined.get(p.id) ?? 0) > 0) p.stats.showdownWins += 1;
     }
 
     this.hand!.board = runBoards[runBoards.length - 1]!.slice();
@@ -1269,7 +1529,7 @@ export class Table {
     if (runBoards.length === 1 && mainAwardedTo.size === 1) {
       this.applySquid([...mainAwardedTo][0]!);
     }
-    this.finishHand(combined, potTotal, true, lastValues, runs);
+    this.finishHand(combined, potTotal, true, lastValues, runs, muckedIds, forceShowAll && (runStages?.[0]?.length ?? 0) > 1);
   }
 
   private orderFromButton(): string[] {
@@ -1408,8 +1668,10 @@ export class Table {
     revealed: boolean,
     values?: Map<string, HandValue>,
     runs?: LastResult["runs"],
+    muckedIds: string[] = [],
+    allInRunout = false,
   ): void {
-    const shown: Record<string, Card[]> = {};
+    const shown: Record<string, (Card | null)[]> = {};
     if (revealed) {
       for (const p of this.players.values()) {
         if (p.shown && p.holeCards) shown[p.id] = p.holeCards.slice();
@@ -1426,10 +1688,26 @@ export class Table {
       runs && runs.length
         ? runs
         : [{ board: board.slice(), winners: winners.map((w) => ({ ...w })) }];
+    if (this.hand) {
+      for (const id of this.hand.vpipIds) {
+        const p = this.players.get(id);
+        if (p) p.stats.vpipHands += 1;
+      }
+      for (const id of this.hand.pfrIds) {
+        const p = this.players.get(id);
+        if (p) p.stats.pfrHands += 1;
+      }
+      for (const id of this.hand.threeBetIds) {
+        const p = this.players.get(id);
+        if (p) p.stats.threeBetHands += 1;
+      }
+    }
     this.lastResult = {
       handNumber: this.nextHandNumber - 1,
       board,
       shown,
+      muckedIds: muckedIds.slice(),
+      allInRunout,
       winners,
       pot: potTotal,
       uncontested: !revealed,
@@ -1443,6 +1721,21 @@ export class Table {
         if (p) this.maybePayBounty(p);
       }
     }
+    this.history.push({
+      handNumber: this.lastResult.handNumber,
+      board: board.slice(),
+      pot: potTotal,
+      winners: winners.filter((w) => w.amount > 0).map((w) => ({
+        id: w.id,
+        nickname: this.players.get(w.id)?.nickname ?? w.id.slice(0, 4),
+        amount: w.amount,
+        handName: w.handName,
+      })),
+      shown: Object.fromEntries(Object.entries(this.lastResult.shown).map(([id, cards]) => [id, cards.slice()])),
+      muckedIds: muckedIds.slice(),
+      actions: this.hand?.handActions.map((a) => ({ ...a })) ?? [],
+    });
+    if (this.history.length > 20) this.history = this.history.slice(-20);
     this.lastTimeoutIds = [];
     this.runoutVote = null;
     this.events.push({ type: "settle" });
@@ -1492,7 +1785,14 @@ export class Table {
       .filter((p) => p.buyinChips > 0 || p.chips > 0)
       .map((p) => {
         const stack = p.chips + p.committed + p.pendingBuyinChips;
-        return { id: p.id, nickname: p.nickname, buyinChips: p.buyinChips, stack, net: stack - p.buyinChips };
+        return {
+          id: p.id,
+          nickname: p.nickname,
+          buyinChips: p.buyinChips,
+          stack,
+          net: stack - p.buyinChips,
+          stats: toHud(p.stats),
+        };
       });
   }
 
@@ -1516,6 +1816,6 @@ export function createTable(input: CreateTableInput, runtime?: RuntimeOpts): Tab
 
 export { randomNickname } from "./names.ts";
 export { newPlayerId } from "./names.ts";
-export { evaluate7, evaluateBest, compareHand, rankName, CATEGORY } from "./rank.ts";
+export { evaluate7, evaluateBest, compareHand, computeEquities, rankName, CATEGORY } from "./rank.ts";
 export { freshDeck, parseCard, parseCards, shuffle, isSevenDeuceOffsuit } from "./cards.ts";
 export { ACTION_MS, DURATION_MINUTES, HAND_PAUSE_MS, PokerError, RUNOUT_VOTE_MS } from "./types.ts";

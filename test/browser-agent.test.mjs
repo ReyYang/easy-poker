@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { agentContext, apiUrl, decide, gameWsUrl, legalMove, MODEL_TIMEOUT_MS, modelTransport, PRESET_BOTS, PROMPTS, reasoningEffortForModel, responsesBody } from "../public/js/agent-core.js";
+import { agentContext, apiUrl, decide, gameWsUrl, humanThinkDelayMs, legalMove, MODEL_TIMEOUT_MS, modelTransport, PRESET_BOTS, PROMPTS, reasoningEffortForModel, responsesBody } from "../public/js/agent-core.js";
 
 test("browser AI clamps model output to the legal action", () => {
   const legal = { canFold: true, canCheck: false, canCall: true, canBet: false, canRaise: true, canAllIn: true, minRaiseTo: 8, maxRaiseTo: 100 };
@@ -91,4 +91,32 @@ test("browser AI retries responses without reasoning before falling back to chat
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("browser AI context includes ante, stats, and handHistory; humanThinkDelayMs respects deadline", () => {
+  const ctx = agentContext({
+    config: { smallBlind: 1, bigBlind: 2, ante: 1, shortDeck: false },
+    me: { id: "hero", holeCards: ["As", "Kd"] },
+    seats: [
+      { playerId: "hero", nickname: "Hero", chips: 200, bet: 4, folded: false, allIn: false, inHand: true, isButton: true, stats: { handsDealt: 10, vpip: 30, pfr: 20, threeBet: 10, wsd: 50 } },
+      { playerId: "bb", nickname: "Villain", chips: 180, bet: 2, folded: false, allIn: false, inHand: true, isBb: true, stats: { handsDealt: 12, vpip: 42, pfr: 17, threeBet: 8, wsd: 40 } },
+    ],
+    street: "flop",
+    board: ["Ah", "7d", "2c"],
+    pot: 12,
+    streetActions: [],
+    handActions: [
+      { street: "preflop", playerId: "hero", nickname: "Hero", type: "raise", amount: 6, label: "加注 6" },
+      { street: "preflop", playerId: "bb", nickname: "Villain", type: "call", amount: 6, label: "跟注 4" },
+    ],
+    legal: { canFold: true, canCheck: true, toCall: 0 },
+  });
+  assert.equal(ctx.blinds.ante, 1);
+  assert.equal(ctx.players[1].stats.vpip, 42);
+  assert.equal(ctx.handHistory.length, 2);
+  assert.equal(ctx.handHistory[0].amountBB, 3);
+
+  assert.equal(humanThinkDelayMs({ actionDeadline: 10_000, now: 5_500 }, { action: "raise" }, 0, () => 0), 0);
+  assert.equal(humanThinkDelayMs({ actionDeadline: 40_000, now: 1_000 }, { action: "check" }, 200, () => 0), 700);
+  assert.equal(humanThinkDelayMs({ actionDeadline: 40_000, now: 1_000, street: "river", legal: { toCall: 10 } }, { action: "call" }, 300, () => 0), 2000);
 });

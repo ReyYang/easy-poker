@@ -1,6 +1,6 @@
 export const MAX_SEATS = 8;
 export const ACTION_MS = 30_000;
-export const HAND_PAUSE_MS = 5_000;
+export const HAND_PAUSE_MS = 7_500;
 export const RUNOUT_VOTE_MS = 5_000;
 export const DURATION_MINUTES = [30, 60, 120, 240, 480] as const;
 export type DurationMinutes = (typeof DURATION_MINUTES)[number];
@@ -26,6 +26,7 @@ export interface TableConfig {
   bounty27Enabled: boolean;
   smallBlind: number;
   bigBlind: number;
+  ante: number;
 }
 
 export interface CreateTableInput {
@@ -38,8 +39,26 @@ export interface CreateTableInput {
   bounty27Enabled?: boolean;
   smallBlind?: number;
   bigBlind?: number;
+  ante?: number;
   tableNumber?: string;
   password?: string;
+}
+
+export interface PlayerStats {
+  handsDealt: number;
+  vpipHands: number;
+  pfrHands: number;
+  threeBetHands: number;
+  showdowns: number;
+  showdownWins: number;
+}
+
+export interface PlayerHud {
+  handsDealt: number;
+  vpip: number;
+  pfr: number;
+  threeBet: number;
+  wsd: number;
 }
 
 export interface PlayerState {
@@ -47,6 +66,7 @@ export interface PlayerState {
   nickname: string;
   seat: number | null;
   sitting: boolean;
+  sittingOut: boolean;
   chips: number;
   buyinCount: number;
   buyinChips: number;
@@ -62,6 +82,7 @@ export interface PlayerState {
   pendingBuyinChips: number;
   timeoutStreak: number;
   lastEmoteAt: number | null;
+  stats: PlayerStats;
 }
 
 export interface RunoutVote {
@@ -79,6 +100,29 @@ export interface HandAction {
   type: ActionType;
   amount?: number;
   allIn?: boolean;
+}
+
+export interface RecordedAction extends HandAction {
+  street: Street;
+  nickname: string;
+  label: string;
+}
+
+export interface RunStage {
+  street: Street;
+  board: Card[];
+  equities: Record<string, number>;
+  outs?: Record<string, number>;
+}
+
+export interface HandSummary {
+  handNumber: number;
+  board: Card[];
+  pot: number;
+  winners: { id: string; nickname: string; amount: number; handName?: string }[];
+  shown: Record<string, (Card | null)[]>;
+  muckedIds: string[];
+  actions: RecordedAction[];
 }
 
 export interface HandState {
@@ -99,6 +143,12 @@ export interface HandState {
   pots: SidePot[];
   streetPot: number;
   streetActions: HandAction[];
+  handActions: RecordedAction[];
+  lastAggressorId: string | null;
+  raiseCount: number;
+  vpipIds: string[];
+  pfrIds: string[];
+  threeBetIds: string[];
 }
 
 export interface SquidState {
@@ -112,6 +162,7 @@ export interface SettlementPlayer {
   buyinChips: number;
   stack: number;
   net: number;
+  stats?: PlayerHud;
 }
 
 export interface Settlement {
